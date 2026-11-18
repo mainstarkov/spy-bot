@@ -11,7 +11,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original = bot.store
         bot.store = Game(':memory:')
-        self.api = SimpleNamespace(send_message=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
+        self.api = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
 
     async def asyncTearDown(self):
         bot.store.db.close()
@@ -30,7 +30,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_online_and_offline(self):
         self.room('online')
         await bot.handle(self.message(1, '/play'), self.api)
-        self.assertEqual(self.api.send_message.await_count, 6)
+        self.assertEqual(self.api.send_photo.await_count, 3)
+        await bot.begin_round(self.api, bot.store.member(1))
         self.api.send_message.reset_mock()
         await bot.handle(self.message(2, 'Аня, тут шумно?'), self.api)
         self.assertEqual(self.api.send_message.await_count, 3)
@@ -42,6 +43,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         room['mode'] = 'offline'
         bot.store.save(room)
         await bot.handle(self.message(1, '/play'), self.api)
+        await bot.begin_round(self.api, bot.store.member(1))
         self.api.send_message.reset_mock()
         message = self.message(2, 'Вопрос')
         await bot.handle(message, self.api)
@@ -63,6 +65,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await bot.handle(self.message(2, '🚀 Начать игру'), self.api)
         await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
         room = bot.store.member(1)
+        code, number = room['code'], room['round']
+        bot.store.pick(1, code, number, 1)
+        with self.assertRaisesRegex(ValueError, 'занята'):
+            bot.store.pick(2, code, number, 1)
+        await bot.begin_round(self.api, bot.store.member(1))
+        room = bot.store.member(1)
+        self.assertEqual(len(set(room['picks'].values())), 3)
         for uid in room['players']:
             labels = [b.text for row in bot.controls(room, uid).keyboard for b in row]
             self.assertEqual('🕵️ Угадать локацию' in labels, uid == room['spy'])
@@ -106,10 +115,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for uid in (2, 3):
             bot.store.join(room['code'], uid, str(uid))
         await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
+        await bot.begin_round(self.api, bot.store.member(1))
         group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
-        self.assertEqual(len(group_messages), 1)
-        self.assertIn('Раунд начался', group_messages[0])
-        self.assertNotIn(bot.store.member(1)['location'], group_messages[0])
+        self.assertEqual(len(group_messages), 2)
+        self.assertIn('Раунд начался', group_messages[-1])
+        self.assertNotIn(bot.store.member(1)['location'], group_messages[-1])
 
     async def test_guess_button_and_stale_callback(self):
         self.room('offline')
@@ -129,9 +139,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.room('online')
         async def send(uid, text, **kwargs):
             if uid == 2:
-                raise TelegramForbiddenError(method=SendMessage(chat_id=uid, text=text), message='blocked')
+                raise TelegramForbiddenError(method=SendMessage(chat_id=uid, text='test'), message='blocked')
         self.api.send_message.side_effect = send
+        self.api.send_photo.side_effect = send
         await bot.handle(self.message(1, '/play'), self.api)
+        await bot.begin_round(self.api, bot.store.member(1))
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
         self.assertNotIn('spy', bot.store.member(1))
 
@@ -140,7 +152,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         room = bot.store.start(1)
         await bot.handle(self.message(int(room['spy']), '/guess ' + room['location'].upper()), self.api)
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
-        self.assertIn('угадал', self.api.send_message.call_args.args[1])
+        self.assertIn('угадал', self.api.send_photo.call_args.kwargs['caption'])
 
 if __name__ == '__main__':
     unittest.main()

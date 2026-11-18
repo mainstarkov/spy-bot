@@ -1,4 +1,5 @@
 import asyncio
+from html import escape
 import logging
 import os
 import time
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from game import Game, LOCATIONS
 
 BASE = Path(__file__).resolve().parent
@@ -17,7 +18,7 @@ dp = Dispatcher()
 lock = asyncio.Lock()
 log = logging.getLogger(__name__)
 joining = set()
-RULES = ('🕵️ Как играть\n\n3–12 игроков. Все, кроме шпиона, знают одну локацию. '
+RULES = ('🕵️ Как играть\n\n3–12 игроков. Выберите по одной карточке. Все, кроме шпиона, узнают локацию. '
          'Задавайте друг другу вопросы: например, «Что здесь обычно делают?» Не называйте локацию напрямую!\n\n'
          'Мирные ищут шпиона. Шпион старается не выдать себя и понять, где все находятся. '
          'У него одна попытка угадать локацию.\n\n'
@@ -30,6 +31,14 @@ ACTIONS = {'🚀 Начать игру': '/play', '🔄 Новый раунд': 
            '📍 Список локаций': '/locations'}
 
 
+async def illustrated(bot, chat_id, art, title, body, markup=None):
+    try:
+        await bot.send_photo(chat_id, FSInputFile(BASE / 'art' / f'{art}.png'),
+                             caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
+    except TelegramAPIError:
+        await bot.send_message(chat_id, f'{title}\n\n{body}', reply_markup=markup)
+
+
 def controls(room=None, uid=None):
     if room is None:
         rows = [['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🔑 Войти по коду'], ['📖 Как играть']]
@@ -40,6 +49,10 @@ def controls(room=None, uid=None):
             if host:
                 rows.insert(0, ['🔄 Новый раунд' if room['round'] else '🚀 Начать игру'])
             rows.append(['🚪 Выйти из комнаты'])
+        elif room['state'] == 'dealing':
+            rows.insert(0, ['🃏 Выбрать карточку'])
+            if host:
+                rows.append(['⏹ Остановить раунд'])
         else:
             rows.append(['🎭 Моя роль', '📍 Список локаций'])
             if room['state'] == 'playing':
@@ -77,9 +90,11 @@ async def invitation(bot, room):
 def lobby(room):
     names = '\n'.join(f'• {name}' + (' 👑' if uid == room['host'] else '') for uid, name in room['players'].items())
     mode = 'в группе Telegram' if room.get('group') else 'онлайн' if room['mode'] == 'online' else 'в кабинете'
-    status = {'lobby': 'Ждём игроков', 'playing': 'Идёт обсуждение', 'voting': 'Выбираем шпиона'}[room['state']]
+    status = {'lobby': 'Ждём игроков', 'dealing': 'Выбираем карточки', 'playing': 'Идёт обсуждение', 'voting': 'Выбираем шпиона'}[room['state']]
     hint = ('Передай друзьям код. Пусть нажмут «Войти по коду» и отправят его боту.\n'
             + ('Когда соберутся хотя бы 3 игрока, создатель может начать раунд кнопкой внизу.' if len(room['players']) < 3 else 'Все готовы? Создатель может начать раунд кнопкой внизу.')) if room['state'] == 'lobby' else ('Задавайте вопросы друг другу.' if room['state'] == 'playing' else 'Выбери подозреваемого в сообщении с голосованием.')
+    if room['state'] == 'dealing':
+        hint = 'Выбери карточку в личке с ботом.'
     return f"👥 Комната {room['code']} · {mode}\n{status}\n\nИгроки ({len(room['players'])}/12):\n{names}\n\n{hint}"
 
 
@@ -128,10 +143,14 @@ async def group_game(message: Message, bot: Bot):
 
 
 async def finish(bot, room, result):
-    text = f"{result}\nШпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nЧтобы сыграть ещё раз, создатель нажимает «Новый раунд»."
+    details = f"Шпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nСоздатель может нажать «Новый раунд»."
     store.finish(room)
-    await broadcast(bot, room, text)
-    await announce(bot, room, text)
+    for uid in room['players']:
+        try:
+            await illustrated(bot, int(uid), 'result', escape(result), escape(details), controls(room, uid))
+        except TelegramAPIError:
+            log.warning('Не удалось доставить итог игроку')
+    await announce(bot, room, f'{result}\n{details}')
 
 
 def ballot(room, uid):
@@ -144,7 +163,8 @@ async def open_voting(bot, room):
     await broadcast(bot, room, 'Обсуждение завершено. Пора выбрать шпиона!')
     for uid in room['players']:
         try:
-            await bot.send_message(int(uid), '🗳 Кто шпион? У тебя один голос и 60 секунд. Нажми на имя подозреваемого.', reply_markup=ballot(room, uid))
+            await illustrated(bot, int(uid), 'vote', '🗳 Кто шпион?',
+                              'У тебя один голос и 60 секунд. Нажми на имя подозреваемого.', ballot(room, uid))
         except TelegramAPIError:
             log.warning('Не удалось доставить кнопки голосования')
 
@@ -174,7 +194,17 @@ async def welcome(message: Message, bot: Bot):
         return
     joining.discard(message.from_user.id)
     room = store.current(message.from_user.id)
-    await message.answer(lobby(room) if room else '🕵️ Шпион\n\nСобери друзей и найди шпиона!\n\n🌐 Онлайн — вопросы и ответы через бота.\n🏫 В кабинете — обсуждение вслух.\n\nСоздай комнату или войди по коду от друга. Кнопки находятся под полем ввода.', reply_markup=controls(room, message.from_user.id))
+    if room:
+        await message.answer(lobby(room), reply_markup=controls(room, message.from_user.id))
+        if room['state'] == 'dealing':
+            await show_cards(bot, room, message.from_user.id)
+        return
+    await illustrated(bot, message.chat.id, 'welcome', '🕵️ Шпион',
+                      'Собери 3–12 друзей и выясни, кто не знает локацию.\n\n'
+                      '🌐 <b>Онлайн</b> — вопросы через бота.\n'
+                      '🏫 <b>В кабинете</b> — вопросы вслух.\n'
+                      '💬 <b>В группе</b> — добавь бота и отправь /spy.\n\n'
+                      'Есть приглашение? Нажми «Войти по коду».', controls())
 
 
 
@@ -239,7 +269,7 @@ async def handle(message, bot):
     text = message.text.strip()
     room = store.current(uid)
     if text == '📖 Как играть':
-        await message.answer(RULES, reply_markup=controls(room, uid))
+        await illustrated(bot, uid, 'welcome', '📖 Как играть', RULES.split('\n\n', 1)[1], controls(room, uid))
         return
     if text == '❌ Отмена':
         joining.discard(uid)
@@ -263,7 +293,7 @@ async def handle(message, bot):
         await announce(bot, room, lobby(room))
         return
     if text == '🎭 Моя роль':
-        if not room or room['state'] == 'lobby':
+        if not room or room['state'] in ('lobby', 'dealing'):
             raise ValueError('Роль появится, когда начнётся раунд.')
         await message.answer(role_text(room, uid), reply_markup=controls(room, uid))
         return
@@ -289,7 +319,11 @@ async def handle(message, bot):
         await message.answer('Чтобы играть, создай комнату или нажми «Войти по коду».', reply_markup=controls())
         return
     room = store.member(uid)
-    if cmd == '/room':
+    if text == '🃏 Выбрать карточку' or (cmd == '/room' and room['state'] == 'dealing'):
+        if room['state'] != 'dealing':
+            raise ValueError('Сейчас карточки не выбираются.')
+        await show_cards(bot, room, uid)
+    elif cmd == '/room':
         await message.answer(await invitation(bot, room), reply_markup=controls(room, uid))
         if room['state'] == 'voting' and str(uid) not in room['votes']:
             await message.answer('Выбери, кто шпион:', reply_markup=ballot(room, uid))
@@ -299,29 +333,25 @@ async def handle(message, bot):
         await broadcast(bot, room, lobby(room))
         await announce(bot, room, lobby(room))
     elif cmd == '/play':
-        room = store.start(uid)
-        failed = []
-        for player in room['players']:
+        room = store.deal(uid)
+        await broadcast(bot, room, '🃏 Выбери карточку в течение 90 секунд. Кто не успеет, получит одну из оставшихся.')
+        await announce(bot, room, '🃏 Выбираем карточки в личке с ботом!')
+        for uid in room['players']:
             try:
-                await bot.send_message(int(player), role_text(room, player), reply_markup=controls(room, player))
+                await show_cards(bot, room, uid)
             except TelegramAPIError:
-                failed.append(player)
-        if failed:
-            store.finish(room)
-            await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
-            return
-        if room.get('group'):
-            instruction = 'Задавайте вопросы друг другу в группе Telegram.'
-            await announce(bot, room, '🕵️ Раунд начался! Роли в личке. Обсуждайте здесь, у вас 5 минут.')
-        else:
-            instruction = 'Пишите сюда: сообщения получат все участники.' if room['mode'] == 'online' else 'Обсуждайте вслух. Телефоны нужны для голосования.'
-        await broadcast(bot, room, 'Раунд начался! 5 минут. Задавайте друг другу вопросы, не называя локацию.\n' + instruction)
+                log.warning('Не удалось доставить карточки')
     elif cmd == '/vote':
         await open_voting(bot, store.host(uid))
     elif cmd == '/stop':
         room = store.host(uid)
         if room['state'] == 'lobby':
             raise ValueError('Раунд ещё не начался.')
+        if room['state'] == 'dealing':
+            store.finish(room)
+            await broadcast(bot, room, 'Выбор карточек отменён создателем.')
+            await announce(bot, room, 'Выбор карточек отменён.')
+            return
         await finish(bot, room, 'Создатель остановил раунд. Победитель не определён.')
     elif cmd == '/guess':
         if room['state'] != 'playing' or str(uid) != room['spy']:
@@ -342,6 +372,58 @@ async def handle(message, bot):
         await message.answer('В этом режиме обсуждайте вслух. Кнопка «Как играть» объяснит правила.' if room['mode'] == 'offline' else 'Обсуждение доступно во время раунда. Нажми «Моя комната».')
 
 
+async def begin_round(bot, room):
+    store.reveal(room)
+    failed = []
+    for player in room['players']:
+        try:
+            await illustrated(bot, int(player), 'spy' if player == room['spy'] else 'agent',
+                              '🎭 Твоя роль', role_text(room, player), controls(room, player))
+        except TelegramAPIError:
+            failed.append(player)
+    if failed:
+        store.finish(room)
+        await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
+        return
+    if room.get('group'):
+        instruction = 'Задавайте вопросы друг другу в группе Telegram.'
+        await announce(bot, room, '🕵️ Раунд начался! Роли в личке. Обсуждайте здесь, у вас 5 минут.')
+    else:
+        instruction = 'Пишите сюда: сообщения получат все участники.' if room['mode'] == 'online' else 'Обсуждайте вслух. Телефоны нужны для голосования.'
+    await broadcast(bot, room, 'Раунд начался! 5 минут. Задавайте друг другу вопросы, не называя локацию.\n' + instruction)
+
+
+async def show_cards(bot, room, uid):
+    picks = room['picks']
+    if str(uid) in picks:
+        await bot.send_message(int(uid), f"✅ Твоя карточка №{picks[str(uid)]}. Ждём остальных.")
+        return
+    buttons = [(f"🃏 №{n}", f"card:{room['code']}:{room['round']}:{n}")
+               for n in range(1, len(room['players'])+1) if n not in picks.values()]
+    await illustrated(bot, int(uid), 'cards', '🃏 Выбери карточку',
+                      f"Занято <b>{len(picks)} из {len(room['players'])}</b>. Нажми на свободный номер.",
+                      keyboard([buttons[i:i+3] for i in range(0, len(buttons), 3)]))
+
+
+@dp.callback_query(F.data.startswith('card:'))
+async def pick_card(query: CallbackQuery, bot: Bot):
+    async with lock:
+        try:
+            _, code, number, card = query.data.split(':')
+            room = store.pick(query.from_user.id, code, int(number), int(card))
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            room = store.current(query.from_user.id)
+            if room and room['state'] == 'dealing':
+                await show_cards(bot, room, query.from_user.id)
+            return
+        await query.answer(f'Карточка №{card} твоя!')
+        if len(room['picks']) == len(room['players']):
+            await begin_round(bot, room)
+        else:
+            await show_cards(bot, room, query.from_user.id)
+
+
 async def timers(bot):
     while True:
         async with lock:
@@ -349,7 +431,9 @@ async def timers(bot):
                 if room.get('deadline', float('inf')) > time.time():
                     continue
                 try:
-                    if room['state'] == 'playing':
+                    if room['state'] == 'dealing':
+                        await begin_round(bot, room)
+                    elif room['state'] == 'playing':
                         await open_voting(bot, room)
                     elif room['state'] == 'voting':
                         await finish(bot, room, store.result(room))

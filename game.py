@@ -69,6 +69,38 @@ class Game:
         self.save(room)
         return room
 
+    def deal(self, uid):
+        room = self.host(uid)
+        if room['state'] != 'lobby' or len(room['players']) < 3:
+            raise ValueError('Для начала нужны хотя бы 3 игрока.')
+        room.update(state='dealing', picks={}, spy_card=secrets.randbelow(len(room['players']))+1,
+                    location=secrets.choice(LOCATIONS), deadline=time.time()+90, round=room['round']+1)
+        self.save(room)
+        return room
+
+    def pick(self, uid, code, number, card):
+        room = self.member(uid)
+        if room['state'] != 'dealing' or room['code'] != code or room['round'] != number or room['deadline'] <= time.time():
+            raise ValueError('Выбор карточек уже закрыт.')
+        if str(uid) in room['picks']:
+            raise ValueError('Ты уже выбрал карточку.')
+        if not 1 <= card <= len(room['players']) or card in room['picks'].values():
+            raise ValueError('Карточка занята. Выбери свободную.')
+        room['picks'][str(uid)] = card
+        self.save(room)
+        return room
+
+    def reveal(self, room):
+        free = set(range(1, len(room['players'])+1)) - set(room['picks'].values())
+        for uid in room['players']:
+            if uid not in room['picks']:
+                card = secrets.choice(sorted(free))
+                room['picks'][uid] = card
+                free.remove(card)
+        spy = next(uid for uid, card in room['picks'].items() if card == room['spy_card'])
+        room.update(state='playing', spy=spy, votes={}, deadline=time.time()+300)
+        self.save(room)
+
     def voting(self, room):
         if room['state'] != 'playing':
             raise ValueError('Сейчас нельзя начать голосование.')
@@ -101,6 +133,8 @@ class Game:
         room.pop('spy', None)
         room.pop('location', None)
         room.pop('deadline', None)
+        room.pop('picks', None)
+        room.pop('spy_card', None)
         self.save(room)
 
     def leave(self, uid):

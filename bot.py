@@ -21,6 +21,7 @@ lock = asyncio.Lock()
 log = logging.getLogger(__name__)
 joining = set()
 challenges = {}
+sticker_id = None
 RULES = ('🕵️ Как играть\n\n3–12 игроков. Выберите по одной карточке. Все, кроме шпиона, узнают локацию. '
          'Задавайте друг другу вопросы: например, «Что здесь обычно делают?» Не называйте локацию напрямую!\n\n'
          'Мирные ищут шпиона. Шпион старается не выдать себя и понять, где все находятся. '
@@ -35,22 +36,28 @@ ACTIONS = {'🚀 Начать игру': '/play', '🔄 Новый раунд': 
 
 
 async def sticker_after(make_request, bot, method):
+    global sticker_id
     result = await make_request(bot, method)
     if isinstance(method, (SendMessage, SendPhoto)):
         try:
-            await bot.send_sticker(result.chat.id, FSInputFile(BASE / 'art' / 'eye-sticker.webp'),
-                                   message_thread_id=result.message_thread_id, disable_notification=True)
+            sent = await bot.send_sticker(
+                result.chat.id, sticker_id or FSInputFile(BASE / 'art' / 'eye-sticker.webp'),
+                message_thread_id=result.message_thread_id, disable_notification=True,
+            )
+            if sent.sticker:
+                sticker_id = sent.sticker.file_id
         except TelegramAPIError:
+            sticker_id = None
             log.warning('Не удалось отправить стикер')
     return result
 
 
-async def illustrated(bot, chat_id, art, title, body, markup=None):
+async def illustrated(bot, chat_id, art, title, body, markup=None, *, protect=False):
     try:
         return await bot.send_photo(chat_id, FSInputFile(BASE / 'art' / art),
-                             caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
+                             caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup, protect_content=protect)
     except TelegramAPIError:
-        return await bot.send_message(chat_id, f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
+        return await bot.send_message(chat_id, f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup, protect_content=protect)
 
 
 def controls(room=None, uid=None):
@@ -74,6 +81,8 @@ def controls(room=None, uid=None):
                     rows.append(['🕵️ Угадать локацию'])
                 if host:
                     rows.append(['🗳 Начать голосование'])
+                    if room['mode'] == 'online' and 'turn' in room:
+                        rows.append(['⏭ Пропустить ход'])
             if host:
                 rows.append(['⏹ Остановить раунд'])
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in row] for row in rows], resize_keyboard=True)
@@ -96,7 +105,7 @@ def role_text(room, uid):
 
 async def send_role(bot, room, uid):
     picture = 'spy-role.jpg' if str(uid) == room['spy'] else f"location-{LOCATIONS.index(room['location'])}.jpg"
-    return await illustrated(bot, int(uid), picture, '🎭 Твоя роль', role_text(room, uid), controls(room, uid))
+    return await illustrated(bot, int(uid), picture, '🎭 Твоя роль', role_text(room, uid), controls(room, uid), protect=True)
 
 
 async def invitation(bot, room):
@@ -387,6 +396,11 @@ async def handle(message, bot):
         await show_cards(bot, room, uid)
     elif cmd == '/room':
         await message.answer(await invitation(bot, room), reply_markup=controls(room, uid))
+        if room['state'] == 'playing' and room['mode'] == 'online' and 'turn' in room:
+            _, asker, target = turn_players(room)
+            current = target if room['question'] else asker
+            action = 'отвечает' if room['question'] else 'задаёт вопрос'
+            await message.answer(f"Сейчас {action} {room['players'][current]}.")
         if room['state'] == 'voting' and str(uid) not in room['votes']:
             await message.answer('Выбери, кто шпион:', reply_markup=ballot(room, uid))
     elif cmd == '/leave':
@@ -403,6 +417,14 @@ async def handle(message, bot):
                 await show_cards(bot, room, uid)
             except TelegramAPIError:
                 log.warning('Не удалось доставить карточки')
+    elif text == '⏭ Пропустить ход':
+        room = store.host(uid)
+        if room['state'] != 'playing' or room['mode'] != 'online' or 'turn' not in room:
+            raise ValueError('Ход можно пропустить во время онлайн-обсуждения.')
+        room.update(turn=room['turn']+1, question=False)
+        store.save(room)
+        await discussion_message(bot, room, '⏭ Создатель передал ход следующему игроку.')
+        await prompt_turn(bot, room)
     elif cmd == '/vote':
         await open_voting(bot, store.host(uid))
     elif cmd == '/stop':

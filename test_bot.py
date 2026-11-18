@@ -85,6 +85,18 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.api.send_message.assert_not_awaited()
         message.answer.assert_awaited_once()
 
+    async def test_only_host_can_skip_waiting_turn(self):
+        self.room('online')
+        room = bot.store.start(1)
+        room.update(turn=0, question=True)
+        bot.store.save(room)
+        with self.assertRaises(ValueError):
+            await bot.handle(self.message(2, '⏭ Пропустить ход'), self.api)
+        await bot.handle(self.message(1, '⏭ Пропустить ход'), self.api)
+        room = bot.store.member(1)
+        self.assertEqual(room['turn'], 1)
+        self.assertFalse(room['question'])
+
     async def test_button_room_flow(self):
         create = self.message(1, '🌐 Создать онлайн')
         await bot.handle(create, self.api)

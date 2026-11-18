@@ -11,7 +11,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original = bot.store
         bot.store = Game(':memory:')
-        self.api = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
+        self.api = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(return_value=SimpleNamespace(message_id=42)), delete_message=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
 
     async def asyncTearDown(self):
         bot.store.db.close()
@@ -21,6 +21,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     def message(self, uid, text):
         return SimpleNamespace(from_user=SimpleNamespace(id=uid, full_name=f'Игрок {uid}'), text=text, answer=AsyncMock())
+
+    async def test_sticker_follows_message(self):
+        from aiogram.methods import SendMessage
+        result = SimpleNamespace(chat=SimpleNamespace(id=1), message_thread_id=None)
+        request = AsyncMock(return_value=result)
+        api = SimpleNamespace(send_sticker=AsyncMock())
+        self.assertIs(await bot.sticker_after(request, api, SendMessage(chat_id=1, text='Привет')), result)
+        api.send_sticker.assert_awaited_once()
+        self.assertEqual(api.send_sticker.call_args.args[0], 1)
 
     async def verify(self, user):
         _, nonce, expected, chat, _ = bot.challenges[user.id]
@@ -36,8 +45,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def complete_countdown(self):
         room = bot.store.member(1)
         self.assertEqual(room['state'], 'countdown')
-        for _ in range(5):
+        self.api.delete_message.reset_mock()
+        for _ in range(3):
             await bot.countdown(self.api, room)
+        self.assertEqual(self.api.delete_message.await_count, len(room['players']))
 
     def room(self, mode):
         room = bot.store.create(1, 'Аня', mode)
@@ -128,8 +139,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.store.join(code, 3, 'Игрок 3')
         room = bot.store.start(1)
         for player in room['players']:
-            message = self.message(int(player), '🎭 Моя роль')
-            await bot.handle(message, self.api)
+            await bot.send_role(self.api, room, player)
             self.assertEqual(room['location'] in self.api.send_photo.call_args.kwargs['caption'], player != room['spy'])
 
     async def test_group_game_keeps_roles_private(self):
@@ -147,7 +157,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
         group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
-        self.assertIn('До начала обсуждения: 5', '\n'.join(group_messages))
+        self.assertIn('До начала обсуждения: 3', '\n'.join(group_messages))
         self.assertIn('задаёт вопрос', group_messages[-1])
         self.assertNotIn(bot.store.member(1)['location'], group_messages[-1])
 
@@ -170,6 +180,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         async def send(uid, text, **kwargs):
             if uid == 2:
                 raise TelegramForbiddenError(method=SendMessage(chat_id=uid, text='test'), message='blocked')
+            return SimpleNamespace(message_id=42)
         self.api.send_message.side_effect = send
         self.api.send_photo.side_effect = send
         await bot.handle(self.message(1, '/play'), self.api)

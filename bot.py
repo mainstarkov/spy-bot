@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
+from aiogram.methods import SendMessage, SendPhoto
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from game import Game, LOCATIONS
 
@@ -33,12 +34,23 @@ ACTIONS = {'🚀 Начать игру': '/play', '🔄 Новый раунд': 
            '📍 Список локаций': '/locations'}
 
 
+async def sticker_after(make_request, bot, method):
+    result = await make_request(bot, method)
+    if isinstance(method, (SendMessage, SendPhoto)):
+        try:
+            await bot.send_sticker(result.chat.id, FSInputFile(BASE / 'art' / 'eye-sticker.webp'),
+                                   message_thread_id=result.message_thread_id, disable_notification=True)
+        except TelegramAPIError:
+            log.warning('Не удалось отправить стикер')
+    return result
+
+
 async def illustrated(bot, chat_id, art, title, body, markup=None):
     try:
-        await bot.send_photo(chat_id, FSInputFile(BASE / 'art' / art),
+        return await bot.send_photo(chat_id, FSInputFile(BASE / 'art' / art),
                              caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
     except TelegramAPIError:
-        await bot.send_message(chat_id, f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
+        return await bot.send_message(chat_id, f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup)
 
 
 def controls(room=None, uid=None):
@@ -56,7 +68,7 @@ def controls(room=None, uid=None):
             if host:
                 rows.append(['⏹ Остановить раунд'])
         else:
-            rows.append(['🎭 Моя роль', '📍 Список локаций'])
+            rows.append(['📍 Список локаций'])
             if room['state'] == 'playing':
                 if str(uid) == room['spy']:
                     rows.append(['🕵️ Угадать локацию'])
@@ -84,7 +96,7 @@ def role_text(room, uid):
 
 async def send_role(bot, room, uid):
     picture = 'spy-role.jpg' if str(uid) == room['spy'] else f"location-{LOCATIONS.index(room['location'])}.jpg"
-    await illustrated(bot, int(uid), picture, '🎭 Твоя роль', role_text(room, uid), controls(room, uid))
+    return await illustrated(bot, int(uid), picture, '🎭 Твоя роль', role_text(room, uid), controls(room, uid))
 
 
 async def invitation(bot, room):
@@ -198,6 +210,7 @@ async def verify(query: CallbackQuery, bot: Bot):
 
 async def finish(bot, room, result):
     details = f"Шпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nСоздатель может нажать «Новый раунд»."
+    await hide_roles(bot, room)
     store.finish(room)
     for uid in room['players']:
         try:
@@ -344,9 +357,7 @@ async def handle(message, bot):
         await announce(bot, room, lobby(room))
         return
     if text == '🎭 Моя роль':
-        if not room or room['state'] in ('lobby', 'dealing'):
-            raise ValueError('Роль появится, когда начнётся раунд.')
-        await send_role(bot, room, uid)
+        await message.answer('Секретная карточка видна только перед началом обсуждения.')
         return
     if text == '🕵️ Угадать локацию':
         room = store.member(uid)
@@ -426,21 +437,35 @@ async def handle(message, bot):
         await message.answer('В этом режиме обсуждайте вслух. Кнопка «Как играть» объяснит правила.' if room['mode'] == 'offline' else 'Обсуждение доступно во время раунда. Нажми «Моя комната».')
 
 
+async def hide_roles(bot, room):
+    for player, message_id in room.get('role_messages', {}).items():
+        try:
+            await bot.delete_message(int(player), message_id)
+        except TelegramAPIError:
+            log.warning('Не удалось скрыть секретную карточку')
+    room.pop('role_messages', None)
+
+
 async def begin_round(bot, room):
     store.reveal(room)
-    room.update(state='countdown', count=5, deadline=time.time()+1, turn=0, question=False)
+    room.update(state='countdown', count=3, deadline=time.time()+1, turn=0, question=False, role_messages={})
     store.save(room)
     failed = []
     for player in room['players']:
         try:
-            await send_role(bot, room, player)
+            message = await send_role(bot, room, player)
+            room['role_messages'][player] = message.message_id
+            store.save(room)
         except TelegramAPIError:
             failed.append(player)
     if failed:
+        await hide_roles(bot, room)
         store.finish(room)
         await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
         return
-    await discussion_message(bot, room, '⏳ До начала обсуждения: 5')
+    await discussion_message(bot, room, '⏳ До начала обсуждения: 3')
+    room['deadline'] = time.time()+1
+    store.save(room)
 
 
 async def discussion_message(bot, room, text):
@@ -507,6 +532,7 @@ async def countdown(bot, room):
         store.save(room)
         await discussion_message(bot, room, f"⏳ До начала обсуждения: {room['count']}")
         return
+    await hide_roles(bot, room)
     room.update(state='playing', deadline=time.time()+300)
     store.save(room)
     await broadcast(bot, room, '▶️ Обсуждение началось! У вас 5 минут.')
@@ -572,6 +598,7 @@ async def main():
     if not token:
         raise SystemExit('Задайте BOT_TOKEN — токен бота от @BotFather (см. README.md).')
     async with Bot(token) as bot:
+        bot.session.middleware(sticker_after)
         task = asyncio.create_task(timers(bot))
         try:
             await dp.start_polling(bot)

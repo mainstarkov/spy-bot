@@ -24,9 +24,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sticker_follows_message(self):
         from aiogram.methods import SendMessage
-        result = SimpleNamespace(chat=SimpleNamespace(id=1), message_thread_id=None)
+        result = SimpleNamespace(chat=SimpleNamespace(id=1, type="private"), message_thread_id=None)
         request = AsyncMock(return_value=result)
-        api = SimpleNamespace(send_sticker=AsyncMock())
+        api = SimpleNamespace(send_sticker=AsyncMock(return_value=SimpleNamespace(chat=result.chat, sticker=None)))
         self.assertIs(await bot.sticker_after(request, api, SendMessage(chat_id=1, text='Привет')), result)
         api.send_sticker.assert_awaited_once()
         self.assertEqual(api.send_sticker.call_args.args[0], 1)
@@ -48,7 +48,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.api.delete_message.reset_mock()
         for _ in range(3):
             await bot.countdown(self.api, room)
-        self.assertEqual(self.api.delete_message.await_count, len(room['players']))
+        self.assertEqual(self.api.delete_message.await_count, len(bot.humans(room)))
 
     def room(self, mode):
         room = bot.store.create(1, 'Аня', mode)
@@ -84,6 +84,39 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle(message, self.api)
         self.api.send_message.assert_not_awaited()
         message.answer.assert_awaited_once()
+
+    async def test_cleanup_only_deletes_tracked_messages_in_requested_chat(self):
+        with bot.store.db:
+            bot.store.db.executemany('INSERT INTO round_messages VALUES (?, ?)', [(1, 40), (1, 41), (2, 40)])
+        api = SimpleNamespace(delete_messages=AsyncMock())
+        await bot.cleanup(api, 1)
+        self.assertEqual(api.delete_messages.call_args.args, (1, [40, 41]))
+        self.assertEqual(bot.store.db.execute('SELECT * FROM round_messages').fetchall(), [(2, 40)])
+
+    async def test_solo_round(self):
+        room = bot.store.create(1, 'Аня', 'solo')
+        with self.assertRaisesRegex(ValueError, 'тренировка'):
+            bot.store.join(room['code'], 2, 'Гость')
+        await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
+        room = bot.store.member(1)
+        query = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock(),
+                                data=f"card:{room['code']}:{room['round']}:1")
+        await bot.pick_card(query, self.api)
+        await self.complete_countdown()
+        await bot.handle(self.message(1, 'Здесь тихо?'), self.api)
+        room = bot.store.member(1)
+        room['npc_next'] = 0
+        await bot.npc_turn(self.api, room)
+        self.assertEqual(bot.store.member(1)['turn'], 1)
+        await bot.handle(self.message(1, '🗳 Начать голосование'), self.api)
+        room = bot.store.member(1)
+        self.assertEqual(set(room['votes']), set(room['npcs']))
+        query.data = f"vote:{room['code']}:{room['round']}:npc1"
+        await bot.vote(query, self.api)
+        self.assertEqual(bot.store.member(1)['state'], 'lobby')
+        await bot.handle(self.message(1, '🚪 Выйти из комнаты'), self.api)
+        self.assertIsNone(bot.store.current(1))
+        self.assertEqual(bot.store.rooms(), [])
 
     async def test_only_host_can_skip_waiting_turn(self):
         self.room('online')

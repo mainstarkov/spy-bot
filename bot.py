@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 joining = set()
 challenges = {}
 sticker_id = None
+private_topics = False
 RULES = ('🕵️ Как играть\n\n3–12 игроков. Выберите по одной карточке. Все, кроме шпиона, узнают локацию. '
          'Задавайте друг другу вопросы: например, «Что здесь обычно делают?» Не называйте локацию напрямую!\n\n'
          'Мирные ищут шпиона. Шпион старается не выдать себя и понять, где все находятся. '
@@ -35,15 +36,68 @@ ACTIONS = {'🚀 Начать игру': '/play', '🔄 Новый раунд': 
            '📍 Список локаций': '/locations'}
 
 
+def humans(room):
+    return [uid for uid in room['players'] if uid not in room.get('npcs', {})]
+
+
+def remember_message(message):
+    if message.chat.type != 'private':
+        return
+    room = store.current(message.chat.id)
+    if room and room['state'] != 'lobby':
+        with store.db:
+            store.db.execute('INSERT OR IGNORE INTO round_messages VALUES (?, ?)',
+                             (message.chat.id, message.message_id))
+
+
+async def cleanup(bot, uid):
+    ids = [row[0] for row in store.db.execute('SELECT message FROM round_messages WHERE chat=?', (uid,))]
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i+100]
+        try:
+            await bot.delete_messages(uid, batch)
+        except TelegramAPIError:
+            log.warning('Не удалось убрать сообщения прошлого раунда')
+            return
+        with store.db:
+            store.db.executemany('DELETE FROM round_messages WHERE chat=? AND message=?',
+                                 [(uid, message) for message in batch])
+
+
+async def prepare_topics(bot, room):
+    room['topics'] = {}
+    if not private_topics:
+        return
+    username = (await bot.me()).username
+    for player in humans(room):
+        chat = int(player)
+        try:
+            topic = await bot.create_forum_topic(chat, f"Шпион · {room['code']} · раунд {room['round']}")
+            link = f"https://t.me/{username}/{topic.message_thread_id}"
+            await bot.send_message(chat, f'🔒 Личная тема раунда: {link}')
+            room['topics'][player] = topic.message_thread_id
+            store.save(room)
+        except TelegramAPIError:
+            log.warning('Личная тема недоступна, игра продолжится в обычной личке')
+
+
 async def sticker_after(make_request, bot, method):
     global sticker_id
+    if private_topics and isinstance(method, (SendMessage, SendPhoto)) and isinstance(method.chat_id, int) and method.chat_id > 0 and method.message_thread_id is None:
+        room = store.current(method.chat_id)
+        if room and room['state'] != 'lobby':
+            topic = room.get('topics', {}).get(str(method.chat_id))
+            if topic:
+                method = method.model_copy(update={'message_thread_id': topic})
     result = await make_request(bot, method)
     if isinstance(method, (SendMessage, SendPhoto)):
+        remember_message(result)
         try:
             sent = await bot.send_sticker(
                 result.chat.id, sticker_id or FSInputFile(BASE / 'art' / 'eye-sticker.webp'),
                 message_thread_id=result.message_thread_id, disable_notification=True,
             )
+            remember_message(sent)
             if sent.sticker:
                 sticker_id = sent.sticker.file_id
         except TelegramAPIError:
@@ -62,7 +116,7 @@ async def illustrated(bot, chat_id, art, title, body, markup=None, *, protect=Fa
 
 def controls(room=None, uid=None):
     if room is None:
-        rows = [['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🔑 Войти по коду'], ['📖 Как играть']]
+        rows = [['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🤖 Играть с ботами', '🔑 Войти по коду'], ['📖 Как играть']]
     else:
         host = str(uid) == room['host']
         rows = [['👥 Моя комната', '📖 Как играть']]
@@ -109,7 +163,7 @@ async def send_role(bot, room, uid):
 
 
 async def invitation(bot, room):
-    if room["state"] != "lobby":
+    if room["state"] != "lobby" or room.get("npcs"):
         return lobby(room)
     username = (await bot.me()).username
     return lobby(room) + f"\n\n🔗 Перешли друзьям ссылку, чтобы войти без кода:\nhttps://t.me/{username}?start=join_{room['code']}"
@@ -121,6 +175,10 @@ def lobby(room):
     status = {'lobby': 'Ждём игроков', 'dealing': 'Выбираем карточки', 'countdown': 'Готовимся к обсуждению', 'playing': 'Идёт обсуждение', 'voting': 'Выбираем шпиона'}[room['state']]
     hint = ('Передай друзьям код. Пусть нажмут «Войти по коду» и отправят его боту.\n'
             + ('Когда соберутся хотя бы 3 игрока, создатель может начать раунд кнопкой внизу.' if len(room['players']) < 3 else 'Все готовы? Создатель может начать раунд кнопкой внизу.')) if room['state'] == 'lobby' else ('Задавайте вопросы друг другу.' if room['state'] == 'playing' else 'Выбери подозреваемого в сообщении с голосованием.')
+    if room.get('npcs'):
+        mode = 'тренировка с ботами'
+        if room['state'] == 'lobby':
+            hint = 'Три виртуальных агента готовы. Нажми кнопку начала игры.'
     if room['state'] == 'countdown':
         hint = 'Роли уже в личке. Ждём первого вопроса.'
     if room['state'] == 'dealing':
@@ -131,7 +189,7 @@ def lobby(room):
 
 async def broadcast(bot, room, text, reply_markup=None):
     failed = []
-    for uid in room['players']:
+    for uid in humans(room):
         try:
             await bot.send_message(int(uid), text, reply_markup=reply_markup if reply_markup is not None else controls(room, uid))
         except TelegramAPIError:
@@ -221,7 +279,7 @@ async def finish(bot, room, result):
     details = f"Шпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nСоздатель может нажать «Новый раунд»."
     await hide_roles(bot, room)
     store.finish(room)
-    for uid in room['players']:
+    for uid in humans(room):
         try:
             await illustrated(bot, int(uid), 'result.png', escape(result), escape(details), controls(room, uid))
         except TelegramAPIError:
@@ -235,9 +293,12 @@ def ballot(room, uid):
 
 async def open_voting(bot, room):
     store.voting(room)
+    for uid in room.get('npcs', {}):
+        room['votes'][uid] = secrets.choice([player for player in room['players'] if player != uid])
+    store.save(room)
     await announce(bot, room, '🗳 Голосование открыто на 60 секунд. Выберите подозреваемого в личке с ботом.')
     await broadcast(bot, room, 'Обсуждение завершено. Пора выбрать шпиона!')
-    for uid in room['players']:
+    for uid in humans(room):
         try:
             await illustrated(bot, int(uid), 'vote.png', '🗳 Кто шпион?',
                               'У тебя один голос и 60 секунд. Нажми на имя подозреваемого.', ballot(room, uid))
@@ -343,6 +404,11 @@ async def handle(message, bot):
     uid = message.from_user.id
     text = message.text.strip()
     room = store.current(uid)
+    thread = getattr(message, 'message_thread_id', None)
+    current_topic = room.get('topics', {}).get(str(uid)) if room else None
+    if private_topics and thread and thread != current_topic:
+        await message.answer('Эта тема относится к другой партии. Открой меню бота в основном чате.')
+        return
     if text == '📖 Как играть':
         await illustrated(bot, uid, 'welcome.png', '📖 Как играть', RULES.split('\n\n', 1)[1], controls(room, uid))
         return
@@ -350,8 +416,10 @@ async def handle(message, bot):
         joining.discard(uid)
         await message.answer('Выбери действие кнопками внизу.', reply_markup=controls(room, uid))
         return
-    if text in ('🌐 Создать онлайн', '🏫 Создать в кабинете'):
-        await challenge(bot, uid, message.from_user, 'online' if text == '🌐 Создать онлайн' else 'offline')
+    modes = {'🌐 Создать онлайн': 'online', '🏫 Создать в кабинете': 'offline',
+             '🤖 Играть с ботами': 'solo'}
+    if text in modes:
+        await challenge(bot, uid, message.from_user, modes[text])
         return
     if text == '🔑 Войти по коду':
         if room:
@@ -405,14 +473,19 @@ async def handle(message, bot):
             await message.answer('Выбери, кто шпион:', reply_markup=ballot(room, uid))
     elif cmd == '/leave':
         room = store.leave(uid)
+        await cleanup(bot, uid)
         await message.answer('Ты вышел из комнаты.', reply_markup=menu())
         await broadcast(bot, room, lobby(room))
         await announce(bot, room, lobby(room))
     elif cmd == '/play':
+        if room['state'] == 'lobby' and room['host'] == str(uid) and len(room['players']) >= 3:
+            for player in humans(room):
+                await cleanup(bot, int(player))
         room = store.deal(uid)
+        await prepare_topics(bot, room)
         await broadcast(bot, room, '🃏 Выбери карточку в течение 90 секунд. Кто не успеет, получит одну из оставшихся.')
         await announce(bot, room, '🃏 Выбираем карточки в личке с ботом!')
-        for uid in room['players']:
+        for uid in humans(room):
             try:
                 await show_cards(bot, room, uid)
             except TelegramAPIError:
@@ -473,7 +546,7 @@ async def begin_round(bot, room):
     room.update(state='countdown', count=3, deadline=time.time()+1, turn=0, question=False, role_messages={})
     store.save(room)
     failed = []
-    for player in room['players']:
+    for player in humans(room):
         try:
             message = await send_role(bot, room, player)
             room['role_messages'][player] = message.message_id
@@ -506,7 +579,8 @@ def turn_players(room):
 async def prompt_turn(bot, room):
     i, asker, target = turn_players(room)
     n = len(room['players'])
-    instruction = 'Задай вопрос через /q текст.' if room.get('group') else 'Напиши вопрос боту обычным сообщением.'
+    instruction = ('Виртуальный агент готовит вопрос.' if asker in room.get('npcs', {}) else
+                   'Задай вопрос через /q текст.' if room.get('group') else 'Напиши вопрос боту обычным сообщением.')
     await discussion_message(bot, room, f"🎙 №{i+1} {room['players'][asker]} задаёт вопрос игроку №{(i+1)%n+1} {room['players'][target]}.\n{instruction}")
 
 
@@ -519,6 +593,8 @@ async def exchange(bot, room, uid, text, answering=None):
         expected = target if waiting_answer else asker
         raise ValueError(f"Сейчас {'отвечает' if waiting_answer else 'задаёт вопрос'} {room['players'][expected]}.")
     room['question'] = not waiting_answer
+    if room.get('npcs'):
+        room['npc_next'] = time.time()+2
     if waiting_answer:
         room['turn'] += 1
     store.save(room)
@@ -526,7 +602,8 @@ async def exchange(bot, room, uid, text, answering=None):
     if waiting_answer:
         await prompt_turn(bot, room)
     else:
-        instruction = 'Отправь /a текст.' if room.get('group') else 'Напиши ответ боту.'
+        instruction = ('Виртуальный агент готовит ответ.' if target in room.get('npcs', {}) else
+                       'Отправь /a текст.' if room.get('group') else 'Напиши ответ боту.')
         await discussion_message(bot, room, f"Ждём ответ от {room['players'][target]}. {instruction}")
 
 
@@ -589,19 +666,50 @@ async def pick_card(query: CallbackQuery, bot: Bot):
                 await show_cards(bot, room, query.from_user.id)
             return
         await query.answer(f'Карточка №{card} твоя!')
-        if len(room['picks']) == len(room['players']):
+        if len(room['picks']) == len(humans(room)):
             await begin_round(bot, room)
         else:
             await show_cards(bot, room, query.from_user.id)
+
+
+NPC_QUESTIONS = (
+    'Что здесь чаще всего слышно?', 'Здесь обычно много людей?', 'Как здесь принято одеваться?',
+    'С чем сюда обычно приходят?', 'Здесь хочется задержаться или уйти побыстрее?',
+)
+LOCATION_CLUES = dict(zip(LOCATIONS, (
+    'Иногда звонок меняет весь распорядок.', 'Здесь часто ждут, пока их позовут.',
+    'Свободно ходить получается не всегда.', 'За окном картина всё время меняется.',
+    'Многое зависит от того, что закажешь.', 'Погода здесь решает почти всё.',
+    'Когда становится темно, все обычно затихают.', 'Иногда нужно подтвердить, кто ты.',
+    'Даже простые вещи требуют осторожности.', 'К вечеру сюда часто возвращаются с вещами.',
+    'На некоторые вещи лучше только смотреть.', 'Внимание обычно направлено в одну точку.',
+    'Самые интересные обитатели живут по своему расписанию.', 'Тут стараются говорить тихо.',
+    'Большую часть времени вокруг вода.',
+)))
+
+
+async def npc_turn(bot, room):
+    _, asker, target = turn_players(room)
+    uid = target if room['question'] else asker
+    if uid not in room['npcs'] or time.time() < room.get('npc_next', 0):
+        return
+    if room['question']:
+        text = ('Смотря когда прийти. У каждого тут свой опыт.' if uid == room['spy']
+                else LOCATION_CLUES[room['location']])
+    else:
+        text = NPC_QUESTIONS[room['turn'] % len(NPC_QUESTIONS)]
+    await exchange(bot, room, uid, text)
 
 
 async def timers(bot):
     while True:
         async with lock:
             for room in store.rooms():
-                if room.get('deadline', float('inf')) > time.time():
-                    continue
                 try:
+                    if room.get('deadline', float('inf')) > time.time():
+                        if room['state'] == 'playing' and room.get('npcs'):
+                            await npc_turn(bot, room)
+                        continue
                     if room['state'] == 'dealing':
                         await begin_round(bot, room)
                     elif room['state'] == 'countdown':
@@ -616,10 +724,12 @@ async def timers(bot):
 
 
 async def main():
+    global private_topics
     token = os.environ.get('BOT_TOKEN')
     if not token:
         raise SystemExit('Задайте BOT_TOKEN — токен бота от @BotFather (см. README.md).')
     async with Bot(token) as bot:
+        private_topics = bool((await bot.me()).has_topics_enabled)
         bot.session.middleware(sticker_after)
         task = asyncio.create_task(timers(bot))
         try:

@@ -10,6 +10,7 @@ class Game:
     def __init__(self, path='spy.sqlite3'):
         self.db = sqlite3.connect(path)
         self.db.execute('CREATE TABLE IF NOT EXISTS rooms (code TEXT PRIMARY KEY, data TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS round_messages (chat INTEGER, message INTEGER, PRIMARY KEY(chat,message))')
 
     def rooms(self):
         return [json.loads(row[0]) for row in self.db.execute('SELECT data FROM rooms')]
@@ -30,12 +31,15 @@ class Game:
     def create(self, uid, name, mode):
         if self.current(uid):
             raise ValueError('Сначала выйди из текущей комнаты: /leave')
-        if mode not in ('online', 'offline'):
+        if mode not in ('online', 'offline', 'solo'):
             raise ValueError('Неизвестный режим.')
         code = secrets.token_hex(3).upper()
         while any(r['code'] == code for r in self.rooms()):
             code = secrets.token_hex(3).upper()
-        room = dict(code=code, host=str(uid), mode=mode, players={str(uid): name[:64]}, state='lobby', votes={}, round=0)
+        room = dict(code=code, host=str(uid), mode='online' if mode == 'solo' else mode, players={str(uid): name[:64]}, state='lobby', votes={}, round=0)
+        if mode == 'solo':
+            room['npcs'] = {f'npc{i}': name for i, name in enumerate(('🤖 Агент Луна', '🤖 Агент Фокс', '🤖 Агент Нова'), 1)}
+            room['players'].update(room['npcs'])
         self.save(room)
         return room
 
@@ -43,6 +47,8 @@ class Game:
         room = self.room(code)
         if self.current(uid):
             raise ValueError('Ты уже в комнате. Посмотреть: /room. Выйти: /leave')
+        if room.get('npcs'):
+            raise ValueError('Это личная тренировка с виртуальными игроками.')
         if room['state'] != 'lobby' or len(room['players']) >= 12:
             raise ValueError('Игра уже идёт или в комнате 12 игроков.')
         room['players'][str(uid)] = name[:64]
@@ -134,7 +140,7 @@ class Game:
         room.pop('location', None)
         room.pop('deadline', None)
         room.pop('picks', None)
-        for key in ('spy_card', 'turn', 'question', 'count'):
+        for key in ('spy_card', 'turn', 'question', 'count', 'npc_next', 'topics'):
             room.pop(key, None)
         self.save(room)
 
@@ -143,7 +149,7 @@ class Game:
         if room['state'] != 'lobby':
             raise ValueError('Во время раунда выход закрыт. Создатель может остановить игру: /stop')
         del room['players'][str(uid)]
-        if not room['players']:
+        if not set(room['players']) - set(room.get('npcs', {})):
             with self.db:
                 self.db.execute('DELETE FROM rooms WHERE code = ?', (room['code'],))
         else:

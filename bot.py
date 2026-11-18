@@ -76,7 +76,7 @@ async def invitation(bot, room):
 
 def lobby(room):
     names = '\n'.join(f'• {name}' + (' 👑' if uid == room['host'] else '') for uid, name in room['players'].items())
-    mode = 'онлайн' if room['mode'] == 'online' else 'в кабинете'
+    mode = 'в группе Telegram' if room.get('group') else 'онлайн' if room['mode'] == 'online' else 'в кабинете'
     status = {'lobby': 'Ждём игроков', 'playing': 'Идёт обсуждение', 'voting': 'Выбираем шпиона'}[room['state']]
     hint = ('Передай друзьям код. Пусть нажмут «Войти по коду» и отправят его боту.\n'
             + ('Когда соберутся хотя бы 3 игрока, создатель может начать раунд кнопкой внизу.' if len(room['players']) < 3 else 'Все готовы? Создатель может начать раунд кнопкой внизу.')) if room['state'] == 'lobby' else ('Задавайте вопросы друг другу.' if room['state'] == 'playing' else 'Выбери подозреваемого в сообщении с голосованием.')
@@ -95,10 +95,43 @@ async def broadcast(bot, room, text, reply_markup=None):
     return failed
 
 
+async def announce(bot, room, text):
+    if room.get('group'):
+        try:
+            await bot.send_message(room['group'], text)
+        except TelegramAPIError:
+            log.warning('Не удалось отправить объявление в группу')
+
+
+@dp.message(Command('spy'), F.chat.type.in_({'group', 'supergroup'}))
+async def group_game(message: Message, bot: Bot):
+    async with lock:
+        active = next((r for r in store.rooms() if r.get('group') == message.chat.id), None)
+        if active is None:
+            if not message.from_user or message.from_user.is_bot:
+                await message.answer('Для создания комнаты отправь команду от своего имени.')
+                return
+            try:
+                active = store.create(message.from_user.id, message.from_user.full_name, 'online')
+            except ValueError as exc:
+                await message.answer(str(exc))
+                return
+            active['group'] = message.chat.id
+            store.save(active)
+        username = (await bot.me()).username
+        url = f"https://t.me/{username}?start=join_{active['code']}"
+        button = InlineKeyboardButton(text='Войти в игру / открыть бота', url=url)
+        await message.answer(
+            lobby(active) + '\n\nОткрой бота по кнопке и нажми «Старт». Создатель запускает игру в личке с ботом.',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]),
+        )
+
+
 async def finish(bot, room, result):
     text = f"{result}\nШпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nЧтобы сыграть ещё раз, создатель нажимает «Новый раунд»."
     store.finish(room)
     await broadcast(bot, room, text)
+    await announce(bot, room, text)
 
 
 def ballot(room, uid):
@@ -107,6 +140,7 @@ def ballot(room, uid):
 
 async def open_voting(bot, room):
     store.voting(room)
+    await announce(bot, room, '🗳 Голосование открыто на 60 секунд. Выберите подозреваемого в личке с ботом.')
     await broadcast(bot, room, 'Обсуждение завершено. Пора выбрать шпиона!')
     for uid in room['players']:
         try:
@@ -136,6 +170,7 @@ async def welcome(message: Message, bot: Bot):
                 return
             joining.discard(uid)
             await broadcast(bot, room, lobby(room))
+            await announce(bot, room, lobby(room))
         return
     joining.discard(message.from_user.id)
     room = store.current(message.from_user.id)
@@ -225,6 +260,7 @@ async def handle(message, bot):
         room = store.join(text, uid, message.from_user.full_name)
         joining.discard(uid)
         await broadcast(bot, room, lobby(room))
+        await announce(bot, room, lobby(room))
         return
     if text == '🎭 Моя роль':
         if not room or room['state'] == 'lobby':
@@ -247,6 +283,7 @@ async def handle(message, bot):
         room = store.join(arg.strip(), uid, message.from_user.full_name)
         joining.discard(uid)
         await broadcast(bot, room, lobby(room))
+        await announce(bot, room, lobby(room))
         return
     if not store.current(uid):
         await message.answer('Чтобы играть, создай комнату или нажми «Войти по коду».', reply_markup=controls())
@@ -260,6 +297,7 @@ async def handle(message, bot):
         room = store.leave(uid)
         await message.answer('Ты вышел из комнаты.', reply_markup=menu())
         await broadcast(bot, room, lobby(room))
+        await announce(bot, room, lobby(room))
     elif cmd == '/play':
         room = store.start(uid)
         failed = []
@@ -272,7 +310,12 @@ async def handle(message, bot):
             store.finish(room)
             await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
             return
-        await broadcast(bot, room, 'Раунд начался! 5 минут. Задавайте друг другу вопросы, не называя локацию.\n' + ('Пишите сюда: сообщения получат все участники.' if room['mode'] == 'online' else 'Обсуждайте вслух. Телефоны нужны для голосования.'))
+        if room.get('group'):
+            instruction = 'Задавайте вопросы друг другу в группе Telegram.'
+            await announce(bot, room, '🕵️ Раунд начался! Роли в личке. Обсуждайте здесь, у вас 5 минут.')
+        else:
+            instruction = 'Пишите сюда: сообщения получат все участники.' if room['mode'] == 'online' else 'Обсуждайте вслух. Телефоны нужны для голосования.'
+        await broadcast(bot, room, 'Раунд начался! 5 минут. Задавайте друг другу вопросы, не называя локацию.\n' + instruction)
     elif cmd == '/vote':
         await open_voting(bot, store.host(uid))
     elif cmd == '/stop':
@@ -289,6 +332,8 @@ async def handle(message, bot):
         await finish(bot, room, 'Шпион угадал локацию и победил!' if won else 'Шпион ошибся. Мирные победили!')
     elif text.startswith('/'):
         await message.answer('Неизвестная команда. Список: /help')
+    elif room['state'] == 'playing' and room.get('group'):
+        await message.answer('Задавай вопросы в группе Telegram. Здесь доступны роль и голосование.')
     elif room['state'] == 'playing' and room['mode'] == 'online':
         if len(text) > 1500:
             raise ValueError('Сообщение слишком длинное: максимум 1500 символов.')

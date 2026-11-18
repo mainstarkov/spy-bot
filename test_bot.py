@@ -95,6 +95,22 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await bot.handle(message, self.api)
             self.assertEqual(room['location'] in message.answer.call_args.args[0], player != room['spy'])
 
+    async def test_group_game_keeps_roles_private(self):
+        message = self.message(1, '/spy')
+        message.from_user.is_bot = False
+        message.chat = SimpleNamespace(id=-100)
+        await bot.group_game(message, self.api)
+        room = bot.store.member(1)
+        self.assertEqual(room['group'], -100)
+        self.assertIn(room['code'], message.answer.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
+        for uid in (2, 3):
+            bot.store.join(room['code'], uid, str(uid))
+        await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
+        group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
+        self.assertEqual(len(group_messages), 1)
+        self.assertIn('Раунд начался', group_messages[0])
+        self.assertNotIn(bot.store.member(1)['location'], group_messages[0])
+
     async def test_guess_button_and_stale_callback(self):
         self.room('offline')
         room = bot.store.start(1)

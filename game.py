@@ -134,7 +134,8 @@ class Game:
         room.pop('location', None)
         room.pop('deadline', None)
         room.pop('picks', None)
-        room.pop('spy_card', None)
+        for key in ('spy_card', 'turn', 'question', 'count'):
+            room.pop(key, None)
         self.save(room)
 
     def leave(self, uid):

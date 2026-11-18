@@ -17,9 +17,27 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.store.db.close()
         bot.store = self.original
         bot.joining.clear()
+        bot.challenges.clear()
 
     def message(self, uid, text):
         return SimpleNamespace(from_user=SimpleNamespace(id=uid, full_name=f'Игрок {uid}'), text=text, answer=AsyncMock())
+
+    async def verify(self, user):
+        _, nonce, expected, chat, _ = bot.challenges[user.id]
+        message = SimpleNamespace(chat=SimpleNamespace(id=chat))
+        wrong_user = SimpleNamespace(id=99)
+        await bot.verify(SimpleNamespace(from_user=wrong_user, message=message,
+                         data=f'verify:{user.id}:{nonce}:{expected}', answer=AsyncMock()), self.api)
+        self.assertIsNone(bot.store.current(user.id))
+        await bot.verify(SimpleNamespace(from_user=user, message=message,
+                         data=f'verify:{user.id}:{nonce}:{expected}', answer=AsyncMock()), self.api)
+        self.assertNotIn(user.id, bot.challenges)
+
+    async def complete_countdown(self):
+        room = bot.store.member(1)
+        self.assertEqual(room['state'], 'countdown')
+        for _ in range(5):
+            await bot.countdown(self.api, room)
 
     def room(self, mode):
         room = bot.store.create(1, 'Аня', mode)
@@ -32,9 +50,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle(self.message(1, '/play'), self.api)
         self.assertEqual(self.api.send_photo.await_count, 3)
         await bot.begin_round(self.api, bot.store.member(1))
+        await self.complete_countdown()
         self.api.send_message.reset_mock()
-        await bot.handle(self.message(2, 'Аня, тут шумно?'), self.api)
-        self.assertEqual(self.api.send_message.await_count, 3)
+        with self.assertRaises(ValueError):
+            await bot.handle(self.message(2, 'Тут шумно?'), self.api)
+        await bot.handle(self.message(1, 'Тут шумно?'), self.api)
+        self.assertTrue(bot.store.member(1)['question'])
+        await bot.handle(self.message(2, 'Иногда.'), self.api)
+        self.assertEqual(bot.store.member(1)['turn'], 1)
         room = bot.store.member(1)
         await bot.open_voting(self.api, room)
         await bot.finish(self.api, room, bot.store.result(room))
@@ -44,6 +67,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         bot.store.save(room)
         await bot.handle(self.message(1, '/play'), self.api)
         await bot.begin_round(self.api, bot.store.member(1))
+        await self.complete_countdown()
         self.api.send_message.reset_mock()
         message = self.message(2, 'Вопрос')
         await bot.handle(message, self.api)
@@ -51,7 +75,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         message.answer.assert_awaited_once()
 
     async def test_button_room_flow(self):
-        await bot.handle(self.message(1, '🌐 Создать онлайн'), self.api)
+        create = self.message(1, '🌐 Создать онлайн')
+        await bot.handle(create, self.api)
+        await self.verify(create.from_user)
         code = bot.store.member(1)['code']
         await bot.handle(self.message(2, '🔑 Войти по коду'), self.api)
         with self.assertRaises(ValueError):
@@ -70,6 +96,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'занята'):
             bot.store.pick(2, code, number, 1)
         await bot.begin_round(self.api, bot.store.member(1))
+        await self.complete_countdown()
         room = bot.store.member(1)
         self.assertEqual(len(set(room['picks'].values())), 3)
         for uid in room['players']:
@@ -90,8 +117,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_invitation_and_role(self):
         message = self.message(1, '🏫 Создать в кабинете')
         await bot.handle(message, self.api)
+        await self.verify(message.from_user)
         code = bot.store.member(1)['code']
-        self.assertIn(f'https://t.me/test_bot?start=join_{code}', message.answer.call_args.args[0])
+        self.assertIn(f'https://t.me/test_bot?start=join_{code}', self.api.send_message.call_args.args[1])
         guest = self.message(2, f'/start join_{code}')
         guest.chat = SimpleNamespace(type='private')
         await bot.welcome(guest, self.api)
@@ -102,23 +130,25 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for player in room['players']:
             message = self.message(int(player), '🎭 Моя роль')
             await bot.handle(message, self.api)
-            self.assertEqual(room['location'] in message.answer.call_args.args[0], player != room['spy'])
+            self.assertEqual(room['location'] in self.api.send_photo.call_args.kwargs['caption'], player != room['spy'])
 
     async def test_group_game_keeps_roles_private(self):
         message = self.message(1, '/spy')
         message.from_user.is_bot = False
         message.chat = SimpleNamespace(id=-100)
         await bot.group_game(message, self.api)
+        await self.verify(message.from_user)
         room = bot.store.member(1)
         self.assertEqual(room['group'], -100)
-        self.assertIn(room['code'], message.answer.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
+        self.assertIn(room['code'], self.api.send_message.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
         for uid in (2, 3):
             bot.store.join(room['code'], uid, str(uid))
         await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
         await bot.begin_round(self.api, bot.store.member(1))
+        await self.complete_countdown()
         group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
-        self.assertEqual(len(group_messages), 2)
-        self.assertIn('Раунд начался', group_messages[-1])
+        self.assertIn('До начала обсуждения: 5', '\n'.join(group_messages))
+        self.assertIn('задаёт вопрос', group_messages[-1])
         self.assertNotIn(bot.store.member(1)['location'], group_messages[-1])
 
     async def test_guess_button_and_stale_callback(self):

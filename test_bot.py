@@ -58,7 +58,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_online_and_offline(self):
         self.room('online')
-        await bot.handle(self.message(1, '/play'), self.api)
+        await bot.start_round(self.api, bot.store.member(1), 1)
         self.assertEqual(self.api.send_animation.await_count, 3)
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
@@ -76,7 +76,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         room = bot.store.member(1)
         room['mode'] = 'offline'
         bot.store.save(room)
-        await bot.handle(self.message(1, '/play'), self.api)
+        await bot.start_round(self.api, bot.store.member(1), 1)
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
         self.api.send_message.reset_mock()
@@ -151,7 +151,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_button_room_flow(self):
         create = self.message(1, '🌐 Создать онлайн')
-        await bot.handle(create, self.api)
+        await bot.challenge(self.api, 1, create.from_user, 'online')
         await self.verify(create.from_user)
         code = bot.store.member(1)['code']
         await bot.handle(self.message(2, '🔑 Войти по коду'), self.api)
@@ -163,8 +163,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle(self.message(3, '🔑 Войти по коду'), self.api)
         await bot.handle(self.message(3, code), self.api)
         with self.assertRaises(ValueError):
-            await bot.handle(self.message(2, '🚀 Начать игру'), self.api)
-        await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
+            await bot.start_round(self.api, bot.store.member(2), 2)
+        await bot.start_round(self.api, bot.store.member(1), 1)
         room = bot.store.member(1)
         code, number = room['code'], room['round']
         bot.store.pick(1, code, number, 1)
@@ -186,12 +186,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(uid, targets)
             self.assertEqual(len(targets), 2)
         await bot.handle(self.message(1, '⏹ Остановить раунд'), self.api)
-        await bot.handle(self.message(1, '🔄 Новый раунд'), self.api)
+        await bot.start_round(self.api, bot.store.member(1), 1)
         self.assertEqual(bot.store.member(1)['round'], 2)
 
     async def test_invitation_and_role(self):
         message = self.message(1, '🏫 Создать в кабинете')
-        await bot.handle(message, self.api)
+        await bot.challenge(self.api, 1, message.from_user, 'offline')
         await self.verify(message.from_user)
         code = bot.store.member(1)['code']
         self.assertIn(f'https://t.me/test_bot?start=join_{code}', self.api.send_animation.call_args.kwargs['caption'])
@@ -218,7 +218,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(room['code'], self.api.send_animation.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
         for uid in (2, 3):
             bot.store.join(room['code'], uid, str(uid))
-        await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
+        query = SimpleNamespace(from_user=SimpleNamespace(id=2), answer=AsyncMock(), message=message,
+                                data=f"groupplay:{room['code']}:0")
+        await bot.group_play(query, self.api)
+        self.assertEqual(bot.store.member(1)['state'], 'lobby')
+        query.from_user.id = 1
+        await bot.group_play(query, self.api)
+        self.assertEqual(bot.store.member(1)['state'], 'dealing')
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
         group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
@@ -249,7 +255,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(message_id=42)
         self.api.send_message.side_effect = send
         self.api.send_photo.side_effect = send
-        await bot.handle(self.message(1, '/play'), self.api)
+        await bot.start_round(self.api, bot.store.member(1), 1)
         await bot.begin_round(self.api, bot.store.member(1))
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
         self.assertNotIn('spy', bot.store.member(1))

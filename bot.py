@@ -134,13 +134,11 @@ async def animated(bot, chat_id, scene, title, body, markup=None):
 
 def controls(room=None, uid=None):
     if room is None:
-        rows = [['💬 Играть в группе'], ['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🔑 Войти по коду', '📖 Как играть']]
+        rows = [['💬 Играть в группе'], ['🔑 Войти по коду', '📖 Как играть']]
     else:
         host = str(uid) == room['host']
         rows = [['👥 Моя комната', '📖 Как играть']]
         if room['state'] == 'lobby':
-            if host:
-                rows.insert(0, ['🔄 Новый раунд' if room['round'] else '🚀 Начать игру'])
             rows.append(['🚪 Выйти из комнаты'])
         elif room['state'] == 'dealing':
             rows.insert(0, ['🃏 Выбрать карточку'])
@@ -248,12 +246,43 @@ async def challenge(bot, chat, user, mode):
 
 
 
-async def group_lobby(bot, room):
+async def group_buttons(bot, room):
     username = (await bot.me()).username
-    button = InlineKeyboardButton(text='Войти в игру', url=f"https://t.me/{username}?start=join_{room['code']}")
+    join = InlineKeyboardButton(text='🔑 Войти в игру / открыть личку',
+                                url=f"https://t.me/{username}?start=join_{room['code']}")
+    rows = [[join]]
+    if room['state'] == 'lobby':
+        label = '🔄 Новый раунд' if room['round'] else '🚀 Начать игру'
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"groupplay:{room['code']}:{room['round']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def group_lobby(bot, room):
     await animated(bot, room['group'], 'lobby', '👥 Игровая комната',
-                   escape(lobby(room)) + '\n\nНажми «Войти в игру», затем «Старт» в личке. Создатель запускает раунд там же.',
-                   InlineKeyboardMarkup(inline_keyboard=[[button]]))
+                   escape(lobby(room)) + '\n\nКаждый нажимает «Войти в игру» и открывает личку. '
+                   'Когда соберутся трое, создатель нажимает «Начать игру» в этой группе.',
+                   await group_buttons(bot, room))
+
+
+@dp.callback_query(F.data.startswith('groupplay:'))
+async def group_play(query: CallbackQuery, bot: Bot):
+    _, code, revision = query.data.split(':')
+    async with lock:
+        room = store.current(query.from_user.id)
+        if not query.message or not room or room['code'] != code or room.get('group') != query.message.chat.id:
+            await query.answer('Эта кнопка для участников игры в этой группе.', show_alert=True)
+            return
+        if room['host'] != str(query.from_user.id):
+            await query.answer('Начать игру может только создатель комнаты.', show_alert=True)
+            return
+        if room['state'] != 'lobby' or str(room['round']) != revision:
+            await query.answer('Эта кнопка устарела. Отправь /spy, чтобы открыть актуальный экран.', show_alert=True)
+            return
+        if len(room['players']) < 3:
+            await query.answer('Нужно хотя бы три игрока. Попроси друзей нажать «Войти в игру».', show_alert=True)
+            return
+        await query.answer('Начинаем! Карточки придут в личку.')
+        await start_round(bot, room, query.from_user.id)
 
 
 @dp.message(Command('spy'), F.chat.type.in_({'group', 'supergroup'}))
@@ -329,7 +358,7 @@ async def finish(bot, room, result, *, voted=False):
             log.warning('Не удалось доставить итог игроку')
     if room.get('group'):
         try:
-            await animated(bot, room['group'], scene, escape(result), escape(details))
+            await animated(bot, room['group'], scene, escape(result), escape(details), await group_buttons(bot, room))
         except TelegramAPIError:
             log.warning('Не удалось доставить итог в группу')
 
@@ -381,7 +410,8 @@ async def welcome(message: Message, bot: Bot):
                 return
             joining.discard(uid)
             await broadcast(bot, room, lobby(room))
-            await announce(bot, room, lobby(room))
+            if room.get('group'):
+                await group_lobby(bot, room)
         return
     joining.discard(message.from_user.id)
     room = store.current(message.from_user.id)
@@ -392,23 +422,14 @@ async def welcome(message: Message, bot: Bot):
         return
     await animated(bot, message.chat.id, 'welcome', '🕵️ Шпион',
                    '<b>Хочешь сыграть в отдельном чате?</b> Нажми «Играть в группе».\n\n'
-                   '<b>С друзьями:</b> создай комнату онлайн или для игры вслух. '
-                   'Есть код? Нажми «Войти по коду».\n\n'
+                   'Игра и обсуждение пройдут в группе. Роли и голосование придут в личку.\n\n'
                    'Игра в группе Telegram: добавь бота и отправь /spy.', controls())
 
 
 
 @dp.callback_query(F.data.startswith('create:'))
 async def create(query: CallbackQuery, bot: Bot):
-    await query.answer()
-    async with lock:
-        try:
-            mode = query.data.split(':')[1]
-            if mode not in ('online', 'offline'):
-                raise ValueError('Создай комнату через новое меню: /start')
-            await challenge(bot, query.from_user.id, query.from_user, mode)
-        except ValueError as exc:
-            await bot.send_message(query.from_user.id, str(exc))
+    await query.answer('Новые игры создаются только в группе. Открой /start → «Играть в группе».', show_alert=True)
 
 
 @dp.callback_query(F.data.startswith('vote:'))
@@ -480,12 +501,11 @@ async def handle(message, bot):
         await animated(bot, uid, 'lobby', '💬 Игра в группе',
                        '<b>1.</b> В Telegram создай приватную группу или выбери существующую.\n'
                        '<b>2.</b> Нажми кнопку ниже и добавь «Шпиона». Если набор не открылся, отправь /spy.\n'
-                       '<b>3.</b> Друзья нажимают «Войти в игру». Создатель начинает раунд в личке.',
+                       '<b>3.</b> Друзья нажимают «Войти в игру». Создатель нажимает «Начать игру» прямо в группе.',
                        InlineKeyboardMarkup(inline_keyboard=[[button]]))
         return
-    modes = {'🌐 Создать онлайн': 'online', '🏫 Создать в кабинете': 'offline'}
-    if text in modes:
-        await challenge(bot, uid, message.from_user, modes[text])
+    if text in ('🌐 Создать онлайн', '🏫 Создать в кабинете', '🤖 Играть с ботами'):
+        await message.answer('Новые партии проходят в Telegram-группе. Нажми «Играть в группе».', reply_markup=controls(room, uid))
         return
     if text == '🔑 Войти по коду':
         if room:
@@ -544,7 +564,10 @@ async def handle(message, bot):
         await broadcast(bot, room, lobby(room))
         await announce(bot, room, lobby(room))
     elif cmd == '/play':
-        await start_round(bot, room, uid)
+        if room.get('group'):
+            await message.answer('Открой группу и нажми «Начать игру». Если кнопки нет, отправь там /spy.')
+        else:
+            await message.answer('Эта комната старого формата. Выйди и нажми «Играть в группе».')
     elif text == '⏭ Пропустить ход':
         room = store.host(uid)
         if room['state'] != 'playing' or room['mode'] != 'online' or 'turn' not in room:
@@ -562,7 +585,8 @@ async def handle(message, bot):
         if room['state'] == 'dealing':
             store.finish(room)
             await broadcast(bot, room, 'Выбор карточек отменён создателем.')
-            await announce(bot, room, 'Выбор карточек отменён.')
+            if room.get('group'):
+                await group_lobby(bot, room)
             return
         await finish(bot, room, 'Создатель остановил раунд. Победитель не определён.')
     elif cmd == '/guess':
@@ -630,7 +654,9 @@ async def begin_round(bot, room):
     if failed:
         await hide_roles(bot, room)
         store.finish(room)
-        await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
+        await broadcast(bot, room, 'Раунд отменён: не все получили роль. Каждый должен открыть личку с ботом и нажать /start.')
+        if room.get('group'):
+            await group_lobby(bot, room)
         return
     await stage_animation(bot, room, 'countdown', '⏳ До начала обсуждения: 3', 'Запомни свою карточку. После отсчёта она исчезнет.')
     room['deadline'] = time.time()+1
@@ -663,7 +689,7 @@ async def prompt_turn(bot, room):
     i, asker, target = turn_players(room)
     n = len(room['players'])
     instruction = ('Виртуальный агент готовит вопрос.' if asker in room.get('npcs', {}) else
-                   'Задай вопрос через /q текст.' if room.get('group') else 'Напиши вопрос боту обычным сообщением.')
+                   'Ответь на это сообщение своим вопросом или отправь /q текст.' if room.get('group') else 'Напиши вопрос боту обычным сообщением.')
     await discussion_message(bot, room, f"🎙 №{i+1} {room['players'][asker]} задаёт вопрос игроку №{(i+1)%n+1} {room['players'][target]}.\n{instruction}")
 
 
@@ -688,10 +714,11 @@ async def exchange(bot, room, uid, text, answering=None):
         await prompt_turn(bot, room)
     else:
         instruction = ('Виртуальный агент готовит ответ.' if target in room.get('npcs', {}) else
-                       'Отправь /a текст.' if room.get('group') else 'Напиши ответ боту.')
+                       'Ответь на это сообщение или отправь /a текст.' if room.get('group') else 'Напиши ответ боту.')
         await discussion_message(bot, room, f"Ждём ответ от {room['players'][target]}. {instruction}")
 
 
+@dp.message(F.chat.type.in_({'group', 'supergroup'}), F.reply_to_message.from_user.is_bot, F.text, ~F.text.startswith('/'))
 @dp.message(Command('q', 'a'), F.chat.type.in_({'group', 'supergroup'}))
 async def group_exchange(message: Message, bot: Bot):
     if not message.from_user or message.from_user.is_bot:
@@ -701,10 +728,16 @@ async def group_exchange(message: Message, bot: Bot):
         if not room or room.get('group') != message.chat.id or room['state'] != 'playing' or 'turn' not in room:
             await message.answer('Это действие доступно участникам во время обсуждения.')
             return
-        parts = message.text.split(maxsplit=1)
-        command, body = parts[0], parts[1] if len(parts) == 2 else ''
+        text = message.text.strip()
+        answering = None
+        if text.startswith('/'):
+            command, *body = text.split(maxsplit=1)
+            answering = command.split('@')[0].lower() == '/a'
+            text = body[0] if body else ''
+        elif message.reply_to_message.from_user.id != bot.id:
+            return
         try:
-            await exchange(bot, room, message.from_user.id, body.strip(), command.split('@')[0].lower() == '/a')
+            await exchange(bot, room, message.from_user.id, text, answering)
         except ValueError as exc:
             await message.answer(str(exc))
 

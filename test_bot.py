@@ -93,6 +93,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.delete_messages.call_args.args, (1, [40, 41]))
         self.assertEqual(bot.store.db.execute('SELECT * FROM round_messages').fetchall(), [(2, 40)])
 
+    async def test_illustrated_guide_and_training_entry(self):
+        await bot.handle(self.message(1, '📖 Как играть'), self.api)
+        args, kwargs = self.api.send_photo.call_args
+        self.assertTrue(str(args[1].path).endswith('guide.jpg'))
+        self.assertIn('Выбери карточку', kwargs['caption'])
+        self.assertEqual(kwargs['reply_markup'].inline_keyboard[0][0].callback_data, 'create:solo')
+        await bot.handle(self.message(1, '🤖 Играть с ботами'), self.api)
+        args, kwargs = self.api.send_photo.call_args
+        self.assertTrue(str(args[1].path).endswith('training.jpg'))
+        self.assertEqual(len(kwargs['reply_markup'].inline_keyboard[0]), 4)
+
     async def test_solo_round(self):
         start = self.message(1, '🤖 Играть с ботами')
         await bot.handle(start, self.api)

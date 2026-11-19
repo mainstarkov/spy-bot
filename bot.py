@@ -24,14 +24,14 @@ joining = set()
 challenges = {}
 sticker_id = None
 private_topics = False
-RULES = ('🕵️ Как играть\n\n3–12 игроков. Выберите по одной карточке. Все, кроме шпиона, узнают локацию. '
-         'Задавайте друг другу вопросы: например, «Что здесь обычно делают?» Не называйте локацию напрямую!\n\n'
-         'Мирные ищут шпиона. Шпион старается не выдать себя и понять, где все находятся. '
-         'У него одна попытка угадать локацию.\n\n'
-         'Обсуждение — 5 минут, затем голосование — 1 минута. '
-         'Если больше всего голосов получил только шпион — побеждают мирные. При ничьей шпион ускользает.\n\n'
-         '🌐 Онлайн: пишите вопросы и ответы сюда — их увидят все участники с вашим именем.\n'
-         '🏫 В кабинете: разговаривайте вслух, а роли и голосование смотрите в телефоне.')
+RULES = (
+    '<b>1. Выбери карточку.</b> Мирные увидят локацию, шпион — только свою роль. '
+    'Запомни картинку до конца отсчёта 3 → 2 → 1.\n\n'
+    '<b>2. Задавай вопросы.</b> Например: «Что здесь обычно слышно?» '
+    'Говори намёками, чтобы не выдать место. У шпиона одна попытка его угадать.\n\n'
+    '<b>3. Проголосуй.</b> Нажми имя подозреваемого. Если единственным лидером голосования стал шпион, побеждают мирные.\n\n'
+    'Играешь впервые? Попробуй тренировку с тремя агентами.'
+)
 ACTIONS = {'🚀 Начать игру': '/play', '🔄 Новый раунд': '/play', '👥 Моя комната': '/room',
            '🚪 Выйти из комнаты': '/leave', '🗳 Начать голосование': '/vote', '⏹ Остановить раунд': '/stop',
            '📍 Список локаций': '/locations'}
@@ -131,7 +131,7 @@ async def animated(bot, chat_id, scene, title, body, markup=None):
 
 def controls(room=None, uid=None):
     if room is None:
-        rows = [['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🤖 Играть с ботами', '🔑 Войти по коду'], ['📖 Как играть']]
+        rows = [['🤖 Играть с ботами'], ['🌐 Создать онлайн', '🏫 Создать в кабинете'], ['🔑 Войти по коду', '📖 Как играть']]
     else:
         host = str(uid) == room['host']
         rows = [['👥 Моя комната', '📖 Как играть']]
@@ -234,9 +234,15 @@ async def challenge(bot, chat, user, mode):
     challenges[user.id] = (now+90, nonce, answer, chat, mode)
     options = [answer, answer+1, answer-1, answer+2]
     secrets.SystemRandom().shuffle(options)
-    await animated(bot, chat, 'verify', '🔒 Проверка перед созданием комнаты',
-                   f'Сколько будет {left} + {right}? Есть одна попытка и 90 секунд.',
-                   keyboard([[(str(n), f"verify:{user.id}:{nonce}:{n}") for n in options]]))
+    choices = keyboard([[(str(n), f"verify:{user.id}:{nonce}:{n}") for n in options]])
+    body = f'Сколько будет <b>{left} + {right}</b>? Нажми ответ. У тебя 90 секунд.'
+    if mode == 'solo':
+        await illustrated(bot, chat, 'training.jpg', '🤖 Тренировка с агентами',
+                          'Три агента уже готовы. После проверки сразу выберешь карточку.\n\n' + body,
+                          choices)
+    else:
+        await animated(bot, chat, 'verify', '🔒 Проверка перед созданием комнаты', body, choices)
+
 
 
 async def group_lobby(bot, room):
@@ -379,11 +385,10 @@ async def welcome(message: Message, bot: Bot):
             await show_cards(bot, room, message.from_user.id)
         return
     await animated(bot, message.chat.id, 'welcome', '🕵️ Шпион',
-                      'Собери 3–12 друзей и выясни, кто не знает локацию.\n\n'
-                      '🌐 <b>Онлайн</b> — вопросы через бота.\n'
-                      '🏫 <b>В кабинете</b> — вопросы вслух.\n'
-                      '💬 <b>В группе</b> — добавь бота и отправь /spy.\n\n'
-                      'Есть приглашение? Нажми «Войти по коду».', controls())
+                   '<b>Хочешь сразу сыграть?</b> Нажми «Играть с ботами».\n\n'
+                   '<b>С друзьями:</b> создай комнату онлайн или для игры вслух. '
+                   'Есть код? Нажми «Войти по коду».\n\n'
+                   'Игра в группе Telegram: добавь бота и отправь /spy.', controls())
 
 
 
@@ -452,7 +457,8 @@ async def handle(message, bot):
         await message.answer('Эта тема относится к другой партии. Открой меню бота в основном чате.')
         return
     if text == '📖 Как играть':
-        await animated(bot, uid, 'welcome', '📖 Как играть', RULES.split('\n\n', 1)[1], controls(room, uid))
+        markup = controls(room, uid) if room else keyboard([[('🤖 Попробовать тренировку', 'create:solo')]])
+        await illustrated(bot, uid, 'guide.jpg', '📖 Как играть', RULES, markup)
         return
     if text == '❌ Отмена':
         joining.discard(uid)

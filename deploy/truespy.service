@@ -1,0 +1,19 @@
+[Unit]
+Description=TrueSpy Telegram game
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/opt/truespy/truespy
+EnvironmentFile=/etc/truespy.env
+Environment=SPY_STATE=/var/lib/truespy/rooms.json
+DynamicUser=yes
+StateDirectory=truespy
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

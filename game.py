@@ -140,7 +140,7 @@ class Game:
         room.pop('location', None)
         room.pop('deadline', None)
         room.pop('picks', None)
-        for key in ('spy_card', 'turn', 'question', 'count', 'npc_next', 'topics'):
+        for key in ('spy_card', 'turn', 'question', 'count', 'npc_next', 'topics', 'answer_signals', 'npc_reasons'):
             room.pop(key, None)
         self.save(room)
 

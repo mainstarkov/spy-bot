@@ -94,10 +94,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.store.db.execute('SELECT * FROM round_messages').fetchall(), [(2, 40)])
 
     async def test_solo_round(self):
-        room = bot.store.create(1, 'Аня', 'solo')
+        start = self.message(1, '🤖 Играть с ботами')
+        await bot.handle(start, self.api)
+        await self.verify(start.from_user)
+        room = bot.store.member(1)
+        self.assertEqual(room['state'], 'dealing')
         with self.assertRaisesRegex(ValueError, 'тренировка'):
             bot.store.join(room['code'], 2, 'Гость')
-        await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
         room = bot.store.member(1)
         query = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock(),
                                 data=f"card:{room['code']}:{room['round']}:1")
@@ -111,8 +114,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle(self.message(1, '🗳 Начать голосование'), self.api)
         room = bot.store.member(1)
         self.assertEqual(set(room['votes']), set(room['npcs']))
+        room['answer_signals'] = {'1': [bot.answer_signal('Не знаю')], 'npc2': [0]}
+        self.assertEqual(bot.npc_suspicion(room, 'npc1'), ('1', 'в ответах были уклончивые фразы'))
         query.data = f"vote:{room['code']}:{room['round']}:npc1"
         await bot.vote(query, self.api)
+        self.assertIn('Как проголосовали агенты', self.api.send_photo.call_args.kwargs['caption'])
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
         await bot.handle(self.message(1, '🚪 Выйти из комнаты'), self.api)
         self.assertIsNone(bot.store.current(1))

@@ -2,6 +2,7 @@ import asyncio
 from html import escape
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -271,12 +272,19 @@ async def verify(query: CallbackQuery, bot: Bot):
             room['group'] = chat
             store.save(room)
             await group_lobby(bot, room)
+        elif mode == 'solo':
+            await start_round(bot, room, user.id)
         else:
             await bot.send_message(chat, await invitation(bot, room), reply_markup=controls(room, user.id))
 
 
 async def finish(bot, room, result):
     details = f"Шпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nСоздатель может нажать «Новый раунд»."
+    if room.get('npc_reasons'):
+        details += '\n\nКак проголосовали агенты:\n' + '\n'.join(
+            f"{room['players'][uid]} → {room['players'][room['votes'][uid]]}: {reason}"
+            for uid, reason in room['npc_reasons'].items()
+        )
     await hide_roles(bot, room)
     store.finish(room)
     for uid in humans(room):
@@ -293,8 +301,12 @@ def ballot(room, uid):
 
 async def open_voting(bot, room):
     store.voting(room)
-    for uid in room.get('npcs', {}):
-        room['votes'][uid] = secrets.choice([player for player in room['players'] if player != uid])
+    if room.get('npcs'):
+        room['npc_reasons'] = {}
+        for uid in room['npcs']:
+            target, reason = npc_suspicion(room, uid)
+            room['votes'][uid] = target
+            room['npc_reasons'][uid] = reason
     store.save(room)
     await announce(bot, room, '🗳 Голосование открыто на 60 секунд. Выберите подозреваемого в личке с ботом.')
     await broadcast(bot, room, 'Обсуждение завершено. Пора выбрать шпиона!')
@@ -478,18 +490,7 @@ async def handle(message, bot):
         await broadcast(bot, room, lobby(room))
         await announce(bot, room, lobby(room))
     elif cmd == '/play':
-        if room['state'] == 'lobby' and room['host'] == str(uid) and len(room['players']) >= 3:
-            for player in humans(room):
-                await cleanup(bot, int(player))
-        room = store.deal(uid)
-        await prepare_topics(bot, room)
-        await broadcast(bot, room, '🃏 Выбери карточку в течение 90 секунд. Кто не успеет, получит одну из оставшихся.')
-        await announce(bot, room, '🃏 Выбираем карточки в личке с ботом!')
-        for uid in humans(room):
-            try:
-                await show_cards(bot, room, uid)
-            except TelegramAPIError:
-                log.warning('Не удалось доставить карточки')
+        await start_round(bot, room, uid)
     elif text == '⏭ Пропустить ход':
         room = store.host(uid)
         if room['state'] != 'playing' or room['mode'] != 'online' or 'turn' not in room:
@@ -531,6 +532,23 @@ async def handle(message, bot):
     else:
         await message.answer('В этом режиме обсуждайте вслух. Кнопка «Как играть» объяснит правила.' if room['mode'] == 'offline' else 'Обсуждение доступно во время раунда. Нажми «Моя комната».')
 
+
+async def start_round(bot, room, uid):
+    if room['state'] == 'lobby' and room['host'] == str(uid) and len(room['players']) >= 3:
+        for player in humans(room):
+            await cleanup(bot, int(player))
+    room = store.deal(uid)
+    await prepare_topics(bot, room)
+    if room.get('npcs'):
+        await show_cards(bot, room, uid)
+        return
+    await broadcast(bot, room, '🃏 Выбери карточку в течение 90 секунд. Кто не успеет, получит одну из оставшихся.')
+    await announce(bot, room, '🃏 Выбираем карточки в личке с ботом!')
+    for uid in humans(room):
+        try:
+            await show_cards(bot, room, uid)
+        except TelegramAPIError:
+            log.warning('Не удалось доставить карточки')
 
 async def hide_roles(bot, room):
     for player, message_id in room.get('role_messages', {}).items():
@@ -592,6 +610,8 @@ async def exchange(bot, room, uid, text, answering=None):
     if (answering is not None and answering != waiting_answer) or str(uid) != (target if waiting_answer else asker):
         expected = target if waiting_answer else asker
         raise ValueError(f"Сейчас {'отвечает' if waiting_answer else 'задаёт вопрос'} {room['players'][expected]}.")
+    if waiting_answer and room.get('npcs'):
+        room.setdefault('answer_signals', {}).setdefault(str(uid), []).append(answer_signal(text))
     room['question'] = not waiting_answer
     if room.get('npcs'):
         room['npc_next'] = time.time()+2
@@ -634,7 +654,8 @@ async def countdown(bot, room):
     await hide_roles(bot, room)
     room.update(state='playing', deadline=time.time()+300)
     store.save(room)
-    await broadcast(bot, room, '▶️ Обсуждение началось! У вас 5 минут.')
+    await broadcast(bot, room, '▶️ Обсуждение началось! У вас 5 минут.' +
+                    (' Задай первый вопрос обычным сообщением. Когда будешь готов, нажми «Начать голосование».' if room.get('npcs') else ''))
     if room['mode'] == 'offline':
         await broadcast(bot, room, 'Обсуждайте вслух и передавайте ход по кругу.')
     else:
@@ -649,7 +670,8 @@ async def show_cards(bot, room, uid):
     buttons = [(f"🃏 №{n}", f"card:{room['code']}:{room['round']}:{n}")
                for n in range(1, len(room['players'])+1) if n not in picks.values()]
     await illustrated(bot, int(uid), 'cards.png', '🃏 Выбери карточку',
-                      f"Занято <b>{len(picks)} из {len(room['players'])}</b>. Нажми на свободный номер.",
+                      ('Нажми на любую карточку. Агенты возьмут остальные, и начнётся раунд.' if room.get('npcs') else
+                       f"Занято <b>{len(picks)} из {len(room['players'])}</b>. Нажми на свободный номер."),
                       keyboard([buttons[i:i+3] for i in range(0, len(buttons), 3)]))
 
 
@@ -670,6 +692,31 @@ async def pick_card(query: CallbackQuery, bot: Bot):
             await begin_round(bot, room)
         else:
             await show_cards(bot, room, query.from_user.id)
+
+
+def answer_signal(text):
+    words = re.findall(r'[а-яёa-z0-9]+', text.casefold())
+    if re.search(r'не знаю|без понятия|затрудняюсь|смотря когда|как повез[её]т', text.casefold()):
+        return 2
+    return 1 if len(words) <= 3 else 0
+
+
+def npc_suspicion(room, voter):
+    signals = room.get('answer_signals', {})
+    candidates = [uid for uid in room['players'] if uid != voter]
+    def score(uid):
+        notes = signals.get(uid, [])
+        return sum(notes) / len(notes) if notes else -1
+    best = max(map(score, candidates))
+    leaders = [uid for uid in candidates if score(uid) == best]
+    target = secrets.choice(leaders)
+    if best > 0:
+        reason = 'в ответах были уклончивые фразы' if 2 in signals[target] else 'ответы были слишком короткими'
+    elif best == 0:
+        reason = 'явных зацепок не было, выбрал среди ответивших'
+    else:
+        reason = 'ответов ещё не было, выбрал наугад'
+    return target, reason
 
 
 NPC_QUESTIONS = (

@@ -59,7 +59,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_online_and_offline(self):
         self.room('online')
         await bot.handle(self.message(1, '/play'), self.api)
-        self.assertEqual(self.api.send_photo.await_count, 3)
+        self.assertEqual(self.api.send_animation.await_count, 3)
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
         self.api.send_message.reset_mock()

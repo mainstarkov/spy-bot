@@ -123,7 +123,7 @@ async def animated(bot, chat_id, scene, title, body, markup=None):
             caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup,
         )
     except TelegramAPIError:
-        fallback = 'vote.png' if scene == 'vote' else 'result.png'
+        fallback = f'{scene}.png' if scene in ('welcome', 'cards', 'vote') else 'result.png'
         return await illustrated(bot, chat_id, fallback, title, body, markup)
 
 
@@ -373,7 +373,7 @@ async def welcome(message: Message, bot: Bot):
         if room['state'] == 'dealing':
             await show_cards(bot, room, message.from_user.id)
         return
-    await illustrated(bot, message.chat.id, 'welcome.png', '🕵️ Шпион',
+    await animated(bot, message.chat.id, 'welcome', '🕵️ Шпион',
                       'Собери 3–12 друзей и выясни, кто не знает локацию.\n\n'
                       '🌐 <b>Онлайн</b> — вопросы через бота.\n'
                       '🏫 <b>В кабинете</b> — вопросы вслух.\n'
@@ -447,7 +447,7 @@ async def handle(message, bot):
         await message.answer('Эта тема относится к другой партии. Открой меню бота в основном чате.')
         return
     if text == '📖 Как играть':
-        await illustrated(bot, uid, 'welcome.png', '📖 Как играть', RULES.split('\n\n', 1)[1], controls(room, uid))
+        await animated(bot, uid, 'welcome', '📖 Как играть', RULES.split('\n\n', 1)[1], controls(room, uid))
         return
     if text == '❌ Отмена':
         joining.discard(uid)
@@ -694,7 +694,7 @@ async def show_cards(bot, room, uid):
         return
     buttons = [(f"🃏 №{n}", f"card:{room['code']}:{room['round']}:{n}")
                for n in range(1, len(room['players'])+1) if n not in picks.values()]
-    await illustrated(bot, int(uid), 'cards.png', '🃏 Выбери карточку',
+    await animated(bot, int(uid), 'cards', '🃏 Выбери карточку',
                       ('Нажми на любую карточку. Агенты возьмут остальные, и начнётся раунд.' if room.get('npcs') else
                        f"Занято <b>{len(picks)} из {len(room['players'])}</b>. Нажми на свободный номер."),
                       keyboard([buttons[i:i+3] for i in range(0, len(buttons), 3)]))

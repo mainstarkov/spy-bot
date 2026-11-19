@@ -11,7 +11,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original = bot.store
         bot.store = Game(':memory:')
-        self.api = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock(return_value=SimpleNamespace(message_id=42)), delete_message=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
+        self.api = SimpleNamespace(send_message=AsyncMock(), send_animation=AsyncMock(), send_photo=AsyncMock(return_value=SimpleNamespace(message_id=42)), delete_message=AsyncMock(), me=AsyncMock(return_value=SimpleNamespace(username="test_bot")))
 
     async def asyncTearDown(self):
         bot.store.db.close()
@@ -118,7 +118,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.npc_suspicion(room, 'npc1'), ('1', 'в ответах были уклончивые фразы'))
         query.data = f"vote:{room['code']}:{room['round']}:npc1"
         await bot.vote(query, self.api)
-        self.assertIn('Как проголосовали агенты', self.api.send_photo.call_args.kwargs['caption'])
+        self.assertIn('Как проголосовали агенты', self.api.send_animation.call_args.kwargs['caption'])
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
         await bot.handle(self.message(1, '🚪 Выйти из комнаты'), self.api)
         self.assertIsNone(bot.store.current(1))
@@ -239,12 +239,27 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
         self.assertNotIn('spy', bot.store.member(1))
 
+    async def test_vote_and_ejection_use_captioned_animations(self):
+        self.room('online')
+        room = bot.store.start(1)
+        await bot.open_voting(self.api, room)
+        args, kwargs = self.api.send_animation.call_args
+        self.assertTrue(str(args[1].path).endswith('vote.mp4'))
+        self.assertIn('Кто шпион?', kwargs['caption'])
+        self.assertIsNotNone(kwargs['reply_markup'])
+        innocent = next(uid for uid in room['players'] if uid != room['spy'])
+        room['votes'] = {uid: innocent for uid in room['players'] if uid != innocent}
+        await bot.finish(self.api, room, bot.store.result(room), voted=True)
+        args, kwargs = self.api.send_animation.call_args
+        self.assertTrue(str(args[1].path).endswith('eject-civil.mp4'))
+        self.assertIn('Это мирный', kwargs['caption'])
+
     async def test_guess_finishes_round(self):
         self.room('online')
         room = bot.store.start(1)
         await bot.handle(self.message(int(room['spy']), '/guess ' + room['location'].upper()), self.api)
         self.assertEqual(bot.store.member(1)['state'], 'lobby')
-        self.assertIn('угадал', self.api.send_photo.call_args.kwargs['caption'])
+        self.assertIn('угадал', self.api.send_animation.call_args.kwargs['caption'])
 
 if __name__ == '__main__':
     unittest.main()

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.methods import SendMessage, SendPhoto
+from aiogram.methods import SendAnimation, SendMessage, SendPhoto
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from game import Game, LOCATIONS
 
@@ -84,15 +84,16 @@ async def prepare_topics(bot, room):
 
 async def sticker_after(make_request, bot, method):
     global sticker_id
-    if private_topics and isinstance(method, (SendMessage, SendPhoto)) and isinstance(method.chat_id, int) and method.chat_id > 0 and method.message_thread_id is None:
+    if private_topics and isinstance(method, (SendMessage, SendPhoto, SendAnimation)) and isinstance(method.chat_id, int) and method.chat_id > 0 and method.message_thread_id is None:
         room = store.current(method.chat_id)
         if room and room['state'] != 'lobby':
             topic = room.get('topics', {}).get(str(method.chat_id))
             if topic:
                 method = method.model_copy(update={'message_thread_id': topic})
     result = await make_request(bot, method)
-    if isinstance(method, (SendMessage, SendPhoto)):
+    if isinstance(method, (SendMessage, SendPhoto, SendAnimation)):
         remember_message(result)
+    if isinstance(method, (SendMessage, SendPhoto)):
         try:
             sent = await bot.send_sticker(
                 result.chat.id, sticker_id or FSInputFile(BASE / 'art' / 'eye-sticker.webp'),
@@ -113,6 +114,17 @@ async def illustrated(bot, chat_id, art, title, body, markup=None, *, protect=Fa
                              caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup, protect_content=protect)
     except TelegramAPIError:
         return await bot.send_message(chat_id, f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup, protect_content=protect)
+
+
+async def animated(bot, chat_id, scene, title, body, markup=None):
+    try:
+        return await bot.send_animation(
+            chat_id, FSInputFile(BASE / 'art' / f'{scene}.mp4'),
+            caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup,
+        )
+    except TelegramAPIError:
+        fallback = 'vote.png' if scene == 'vote' else 'result.png'
+        return await illustrated(bot, chat_id, fallback, title, body, markup)
 
 
 def controls(room=None, uid=None):
@@ -278,8 +290,18 @@ async def verify(query: CallbackQuery, bot: Bot):
             await bot.send_message(chat, await invitation(bot, room), reply_markup=controls(room, user.id))
 
 
-async def finish(bot, room, result):
+async def finish(bot, room, result, *, voted=False):
     details = f"Шпион: {room['players'][room['spy']]}\nЛокация: {room['location']}\n\nСоздатель может нажать «Новый раунд»."
+    scene = 'result'
+    if voted:
+        ejected = store.ejected(room)
+        if ejected is None:
+            details = 'Никого не исключили.\n\n' + details
+        else:
+            is_spy = ejected == room['spy']
+            scene = 'eject-spy' if is_spy else 'eject-civil'
+            role = 'шпион' if is_spy else 'мирный'
+            details = f"Исключён игрок {room['players'][ejected]}. Это {role}.\n\n" + details
     if room.get('npc_reasons'):
         details += '\n\nКак проголосовали агенты:\n' + '\n'.join(
             f"{room['players'][uid]} → {room['players'][room['votes'][uid]]}: {reason}"
@@ -289,10 +311,14 @@ async def finish(bot, room, result):
     store.finish(room)
     for uid in humans(room):
         try:
-            await illustrated(bot, int(uid), 'result.png', escape(result), escape(details), controls(room, uid))
+            await animated(bot, int(uid), scene, escape(result), escape(details), controls(room, uid))
         except TelegramAPIError:
             log.warning('Не удалось доставить итог игроку')
-    await announce(bot, room, f'{result}\n{details}')
+    if room.get('group'):
+        try:
+            await animated(bot, room['group'], scene, escape(result), escape(details))
+        except TelegramAPIError:
+            log.warning('Не удалось доставить итог в группу')
 
 
 def ballot(room, uid):
@@ -309,10 +335,9 @@ async def open_voting(bot, room):
             room['npc_reasons'][uid] = reason
     store.save(room)
     await announce(bot, room, '🗳 Голосование открыто на 60 секунд. Выберите подозреваемого в личке с ботом.')
-    await broadcast(bot, room, 'Обсуждение завершено. Пора выбрать шпиона!')
     for uid in humans(room):
         try:
-            await illustrated(bot, int(uid), 'vote.png', '🗳 Кто шпион?',
+            await animated(bot, int(uid), 'vote', '🗳 Кто шпион?',
                               'У тебя один голос и 60 секунд. Нажми на имя подозреваемого.', ballot(room, uid))
         except TelegramAPIError:
             log.warning('Не удалось доставить кнопки голосования')
@@ -378,7 +403,7 @@ async def vote(query: CallbackQuery, bot: Bot):
             room = store.vote(query.from_user.id, target, int(round_number))
             await bot.send_message(query.from_user.id, 'Голос принят.')
             if len(room['votes']) == len(room['players']):
-                await finish(bot, room, store.result(room))
+                await finish(bot, room, store.result(room), voted=True)
         except ValueError as exc:
             await bot.send_message(query.from_user.id, str(exc))
 
@@ -764,7 +789,7 @@ async def timers(bot):
                     elif room['state'] == 'playing':
                         await open_voting(bot, room)
                     elif room['state'] == 'voting':
-                        await finish(bot, room, store.result(room))
+                        await finish(bot, room, store.result(room), voted=True)
                 except TelegramAPIError:
                     log.warning('Ошибка доставки уведомления таймера')
         await asyncio.sleep(1)

@@ -127,12 +127,20 @@ class Game:
         self.save(room)
         return room
 
-    def result(self, room):
-        counts = {p: list(room['votes'].values()).count(p) for p in room['players']}
+    def ejected(self, room):
+        votes = list(room['votes'].values())
+        counts = {p: votes.count(p) for p in room['players']}
         top = max(counts.values())
         leaders = [p for p, n in counts.items() if n == top]
-        caught = top > 0 and len(leaders) == 1 and leaders[0] == room['spy']
-        return 'Мирные победили!' if caught else 'Шпион победил! При ничьей или отсутствии голосов шпион ускользает.'
+        return leaders[0] if top > 0 and len(leaders) == 1 else None
+
+    def result(self, room):
+        ejected = self.ejected(room)
+        if ejected is None:
+            return 'Шпион победил: голосование никого не исключило.'
+        if ejected == room['spy']:
+            return 'Мирные победили!'
+        return 'Шпион победил: игроки исключили мирного.'
 
     def finish(self, room):
         room.update(state='lobby', votes={})

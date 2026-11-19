@@ -98,15 +98,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = self.api.send_photo.call_args
         self.assertTrue(str(args[1].path).endswith('guide.jpg'))
         self.assertIn('Выбери карточку', kwargs['caption'])
-        self.assertEqual(kwargs['reply_markup'].inline_keyboard[0][0].callback_data, 'create:solo')
-        await bot.handle(self.message(1, '🤖 Играть с ботами'), self.api)
+        await bot.handle(self.message(1, '💬 Играть в группе'), self.api)
+        self.assertEqual(self.api.send_animation.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url,
+                         'https://t.me/test_bot?startgroup=group')
+        await bot.challenge(self.api, 1, self.message(1, '').from_user, 'solo')
         args, kwargs = self.api.send_photo.call_args
         self.assertTrue(str(args[1].path).endswith('training.jpg'))
         self.assertEqual(len(kwargs['reply_markup'].inline_keyboard[0]), 4)
 
     async def test_solo_round(self):
         start = self.message(1, '🤖 Играть с ботами')
-        await bot.handle(start, self.api)
+        await bot.challenge(self.api, 1, start.from_user, 'solo')
         await self.verify(start.from_user)
         room = bot.store.member(1)
         self.assertEqual(room['state'], 'dealing')
@@ -207,8 +209,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_game_keeps_roles_private(self):
         message = self.message(1, '/spy')
         message.from_user.is_bot = False
-        message.chat = SimpleNamespace(id=-100)
-        await bot.group_game(message, self.api)
+        message.chat = SimpleNamespace(id=-100, type='supergroup')
+        message.text = '/start@test_bot group'
+        await bot.welcome(message, self.api)
         await self.verify(message.from_user)
         room = bot.store.member(1)
         self.assertEqual(room['group'], -100)

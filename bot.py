@@ -123,7 +123,9 @@ async def animated(bot, chat_id, scene, title, body, markup=None):
             caption=f'<b>{title}</b>\n\n{body}', parse_mode='HTML', reply_markup=markup,
         )
     except TelegramAPIError:
-        fallback = f'{scene}.png' if scene in ('welcome', 'cards', 'vote') else 'result.png'
+        fallback = f'{scene}.png'
+        if not (BASE / 'art' / fallback).is_file():
+            fallback = 'result.png'
         return await illustrated(bot, chat_id, fallback, title, body, markup)
 
 
@@ -232,15 +234,17 @@ async def challenge(bot, chat, user, mode):
     challenges[user.id] = (now+90, nonce, answer, chat, mode)
     options = [answer, answer+1, answer-1, answer+2]
     secrets.SystemRandom().shuffle(options)
-    await bot.send_message(chat, f'🔒 Проверка перед созданием комнаты\n\nСколько будет {left} + {right}? Есть одна попытка и 90 секунд.',
-                           reply_markup=keyboard([[(str(n), f"verify:{user.id}:{nonce}:{n}") for n in options]]))
+    await animated(bot, chat, 'verify', '🔒 Проверка перед созданием комнаты',
+                   f'Сколько будет {left} + {right}? Есть одна попытка и 90 секунд.',
+                   keyboard([[(str(n), f"verify:{user.id}:{nonce}:{n}") for n in options]]))
 
 
 async def group_lobby(bot, room):
     username = (await bot.me()).username
     button = InlineKeyboardButton(text='Войти в игру', url=f"https://t.me/{username}?start=join_{room['code']}")
-    await bot.send_message(room['group'], lobby(room) + '\n\nНажми «Войти в игру», затем «Старт» в личке. Создатель запускает раунд там же.',
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]))
+    await animated(bot, room['group'], 'lobby', '👥 Игровая комната',
+                   escape(lobby(room)) + '\n\nНажми «Войти в игру», затем «Старт» в личке. Создатель запускает раунд там же.',
+                   InlineKeyboardMarkup(inline_keyboard=[[button]]))
 
 
 @dp.message(Command('spy'), F.chat.type.in_({'group', 'supergroup'}))
@@ -287,7 +291,7 @@ async def verify(query: CallbackQuery, bot: Bot):
         elif mode == 'solo':
             await start_round(bot, room, user.id)
         else:
-            await bot.send_message(chat, await invitation(bot, room), reply_markup=controls(room, user.id))
+            await animated(bot, chat, 'lobby', '👥 Игровая комната', escape(await invitation(bot, room)), controls(room, user.id))
 
 
 async def finish(bot, room, result, *, voted=False):
@@ -334,7 +338,8 @@ async def open_voting(bot, room):
             room['votes'][uid] = target
             room['npc_reasons'][uid] = reason
     store.save(room)
-    await announce(bot, room, '🗳 Голосование открыто на 60 секунд. Выберите подозреваемого в личке с ботом.')
+    if room.get('group'):
+        await stage_animation(bot, room, 'vote', '🗳 Голосование', 'У вас 60 секунд. Кнопки с именами в личке с ботом.')
     for uid in humans(room):
         try:
             await animated(bot, int(uid), 'vote', '🗳 Кто шпион?',
@@ -500,7 +505,7 @@ async def handle(message, bot):
             raise ValueError('Сейчас карточки не выбираются.')
         await show_cards(bot, room, uid)
     elif cmd == '/room':
-        await message.answer(await invitation(bot, room), reply_markup=controls(room, uid))
+        await animated(bot, uid, 'lobby', '👥 Моя комната', escape(await invitation(bot, room)), controls(room, uid))
         if room['state'] == 'playing' and room['mode'] == 'online' and 'turn' in room:
             _, asker, target = turn_players(room)
             current = target if room['question'] else asker
@@ -601,9 +606,18 @@ async def begin_round(bot, room):
         store.finish(room)
         await broadcast(bot, room, 'Раунд отменён: не все получили роль. Все игроки должны разблокировать бота и нажать /start. Затем создатель сможет снова нажать «Начать игру».')
         return
-    await discussion_message(bot, room, '⏳ До начала обсуждения: 3')
+    await stage_animation(bot, room, 'countdown', '⏳ До начала обсуждения: 3', 'Запомни свою карточку. После отсчёта она исчезнет.')
     room['deadline'] = time.time()+1
     store.save(room)
+
+
+async def stage_animation(bot, room, scene, title, body):
+    for chat in [room['group']] if room.get('group') else map(int, humans(room)):
+        try:
+            markup = None if room.get('group') else controls(room, chat)
+            await animated(bot, chat, scene, title, body, markup)
+        except TelegramAPIError:
+            log.warning('Не удалось отправить анимацию этапа %s', scene)
 
 
 async def discussion_message(bot, room, text):
@@ -679,8 +693,8 @@ async def countdown(bot, room):
     await hide_roles(bot, room)
     room.update(state='playing', deadline=time.time()+300)
     store.save(room)
-    await broadcast(bot, room, '▶️ Обсуждение началось! У вас 5 минут.' +
-                    (' Задай первый вопрос обычным сообщением. Когда будешь готов, нажми «Начать голосование».' if room.get('npcs') else ''))
+    await stage_animation(bot, room, 'discussion', '▶️ Обсуждение началось!',
+                          'У вас 5 минут.' + (' Задай первый вопрос обычным сообщением. Когда будешь готов, нажми «Начать голосование».' if room.get('npcs') else ''))
     if room['mode'] == 'offline':
         await broadcast(bot, room, 'Обсуждайте вслух и передавайте ход по кругу.')
     else:

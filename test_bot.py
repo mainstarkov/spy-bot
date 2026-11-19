@@ -181,7 +181,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await bot.handle(message, self.api)
         await self.verify(message.from_user)
         code = bot.store.member(1)['code']
-        self.assertIn(f'https://t.me/test_bot?start=join_{code}', self.api.send_message.call_args.args[1])
+        self.assertIn(f'https://t.me/test_bot?start=join_{code}', self.api.send_animation.call_args.kwargs['caption'])
         guest = self.message(2, f'/start join_{code}')
         guest.chat = SimpleNamespace(type='private')
         await bot.welcome(guest, self.api)
@@ -201,14 +201,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.verify(message.from_user)
         room = bot.store.member(1)
         self.assertEqual(room['group'], -100)
-        self.assertIn(room['code'], self.api.send_message.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
+        self.assertIn(room['code'], self.api.send_animation.call_args.kwargs['reply_markup'].inline_keyboard[0][0].url)
         for uid in (2, 3):
             bot.store.join(room['code'], uid, str(uid))
         await bot.handle(self.message(1, '🚀 Начать игру'), self.api)
         await bot.begin_round(self.api, bot.store.member(1))
         await self.complete_countdown()
         group_messages = [call.args[1] for call in self.api.send_message.call_args_list if call.args[0] == -100]
-        self.assertIn('До начала обсуждения: 3', '\n'.join(group_messages))
+        captions = [c.kwargs['caption'] for c in self.api.send_animation.call_args_list if c.args[0] == -100]
+        self.assertIn('До начала обсуждения: 3', '\n'.join(captions))
         self.assertIn('задаёт вопрос', group_messages[-1])
         self.assertNotIn(bot.store.member(1)['location'], group_messages[-1])
 

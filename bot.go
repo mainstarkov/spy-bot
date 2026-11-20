@@ -47,7 +47,7 @@ func (b *bot) joinLink(r *room) string {
 	return "https://t.me/" + b.me.Username + "?start=join_" + r.Code
 }
 func (b *bot) menu(uid int64) {
-	b.tell(uid, "🕵️ ШПИОН\n\nСобери 3–12 друзей в приватной группе. Сыграйте в общем чате, а секретные карточки и голоса получите в личке.\n\nСоздай группу в Telegram и добавь туда бота.", [][]button{
+	b.tell(uid, "🕵️ ШПИОН\n\nИгра для 3–12 человек. Добавь бота в приватную группу. Обсуждение идёт в группе, карточки и голоса приходят в личку.", [][]button{
 		{{Text: "➕ Добавить в группу", URL: b.groupLink()}},
 		{{Text: "📖 Как играть", Data: "help"}, {Text: "👥 Моя комната", Data: "room"}},
 	}, "welcome.mp4")
@@ -57,7 +57,13 @@ func (b *bot) rules(uid int64) {
 }
 func (b *bot) lobby(r *room) {
 	var text strings.Builder
-	fmt.Fprintf(&text, "👥 НАБОР В ИГРУ · %d/12\n\n", len(r.Players))
+	ready := 0
+	for _, p := range r.Players {
+		if p.Ready {
+			ready++
+		}
+	}
+	fmt.Fprintf(&text, "👥 НАБОР В ИГРУ · %d/12\nГотовы: %d из %d\n\n", len(r.Players), ready, len(r.Players))
 	for _, p := range r.Players {
 		mark := "✅"
 		if !p.Ready {
@@ -68,18 +74,55 @@ func (b *bot) lobby(r *room) {
 		}
 		fmt.Fprintf(&text, "%s %s\n", mark, p.Name)
 	}
-	text.WriteString("\nКаждый, включая создателя, нажимает «Войти в игру». Когда готовы хотя бы трое, создатель нажимает «Начать игру».")
-	b.tell(r.Group, text.String(), b.lobbyButtons(r), "lobby.mp4")
+	text.WriteString("\n✅ Личка открыта · ⏳ Нужно нажать «Войти в игру»")
+	body := text.String()
+	keyboard := b.lobbyButtons(r)
+	if r.LobbyMessage != 0 {
+		if r.LobbyText == body {
+			return
+		}
+		f := fields{"chat_id": r.Group, "message_id": r.LobbyMessage, "caption": body,
+			"reply_markup": fields{"inline_keyboard": keyboard}}
+		err := b.api.call(b.ctx, "editMessageCaption", f, "", "", nil)
+		if err != nil && !strings.Contains(err.Error(), "message is not modified") {
+			delete(f, "caption")
+			f["text"] = body
+			err = b.api.call(b.ctx, "editMessageText", f, "", "", nil)
+		}
+		if err == nil || strings.Contains(err.Error(), "message is not modified") {
+			r.LobbyText = body
+			return
+		}
+		if !strings.Contains(err.Error(), "message to edit not found") && !strings.Contains(err.Error(), "message can't be edited") {
+			b.logger.Printf("update lobby: %v", err)
+			return
+		}
+	}
+	id, err := b.send(r.Group, body, keyboard, "lobby.mp4", false)
+	if err != nil {
+		b.logger.Print(err)
+		return
+	}
+	r.LobbyMessage, r.LobbyText = id, body
+	if id > 0 {
+		r.GroupMessages = append(r.GroupMessages, id)
+	}
 }
 func (b *bot) lobbyButtons(r *room) [][]button {
 	label := "🚀 Начать игру"
 	if r.Round > 0 {
 		label = "🔄 Новый раунд"
 	}
-	return [][]button{
-		{{Text: "🔑 Войти в игру", URL: b.joinLink(r)}},
-		{{Text: label, Data: fmt.Sprintf("play:%s:%d", r.Code, r.Round)}},
+	buttons := [][]button{{{Text: "🔑 Войти в игру", URL: b.joinLink(r)}}}
+	if len(r.Players) < 3 {
+		return buttons
 	}
+	for _, p := range r.Players {
+		if !p.Ready {
+			return buttons
+		}
+	}
+	return append(buttons, []button{{Text: label, Data: fmt.Sprintf("play:%s:%d", r.Code, r.Round)}})
 }
 func playerName(u user) string {
 	name := strings.TrimSpace(strings.Join(strings.Fields(u.First+" "+u.Last), " "))
@@ -176,6 +219,7 @@ func (b *bot) handleMessage(m *message) {
 func (b *bot) openLobby(group int64, u user) {
 	if r := b.state.Rooms[group]; r != nil {
 		if r.Phase == "lobby" {
+			r.LobbyText = ""
 			b.lobby(r)
 		} else {
 			b.tell(group, "Раунд уже идёт. Карточки и голосование находятся в личке.", nil, "")
@@ -514,6 +558,7 @@ func (b *bot) finish(r *room, text string, voted bool) {
 	b.tell(r.Group, "🏁 "+text, b.lobbyButtons(r), scene)
 }
 func (b *bot) cleanupGroup(r *room) {
+	r.LobbyMessage, r.LobbyText = 0, ""
 	for len(r.GroupMessages) > 0 {
 		batch := min(100, len(r.GroupMessages))
 		if err := b.api.call(b.ctx, "deleteMessages", fields{"chat_id": r.Group, "message_ids": r.GroupMessages[:batch]}, "", "", nil); err != nil {

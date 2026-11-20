@@ -78,6 +78,21 @@ func TestRoundFromGroup(t *testing.T) {
 	for uid := int64(1); uid <= 3; uid++ {
 		b.join(user{ID: uid, First: "Игрок"}, r.Code)
 	}
+	var lobbyPosts, lobbyEdits int
+	for _, d := range sent {
+		if d.Asset == "lobby.mp4" {
+			lobbyPosts++
+		}
+		if d.Method == "editMessageCaption" {
+			lobbyEdits++
+		}
+	}
+	if lobbyPosts != 1 || lobbyEdits != 3 {
+		t.Fatalf("want one lobby post and three updates, got %d and %d", lobbyPosts, lobbyEdits)
+	}
+	if len(b.lobbyButtons(r)) != 2 {
+		t.Fatal("ready lobby should show the start button")
+	}
 	click(group, 2, play)
 	if r.Phase != "lobby" {
 		t.Fatal("guest started the round")

@@ -37,6 +37,8 @@ type room struct {
 	Turn          int
 	Answer        bool
 	GroupMessages []int
+	LobbyMessage  int
+	LobbyText     string
 }
 
 func random(n int) int {
